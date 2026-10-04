@@ -1,0 +1,225 @@
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+import { PurchaseModel, SupplierTransaction, Supplier } from "../types";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+export function computeDynamicPurchases(
+  purchases: PurchaseModel[] = [],
+  supplierTransactions: SupplierTransaction[] = [],
+  suppliers: Supplier[] = []
+): PurchaseModel[] {
+  if (!purchases || purchases.length === 0) {
+    return [];
+  }
+
+  // Map to hold payments and returns for each supplier
+  const supplierPaymentsMap = new Map<string, number>();
+  const supplierReturnsMap = new Map<string, number>();
+
+  supplierTransactions.forEach((tx) => {
+    if (tx.type === "payment") {
+      const current = supplierPaymentsMap.get(tx.supplierId) || 0;
+      const lessVal = (tx as any).lessAmount || 0;
+      supplierPaymentsMap.set(tx.supplierId, current + (tx.totalAmount || 0) + lessVal);
+    } else if (tx.type === "return") {
+      const isAutoCompanion = tx.refNo?.startsWith("RET-PUR-") || tx.notes?.includes("Auto adjustment on purchase");
+      const isDueAdjusted = tx.notes?.includes("Automatically adjusted from due") || tx.paymentMethod === "Due Adjusted";
+      if (!isAutoCompanion && isDueAdjusted) {
+        const current = supplierReturnsMap.get(tx.supplierId) || 0;
+        supplierReturnsMap.set(tx.supplierId, current + (tx.totalAmount || 0));
+      }
+    }
+  });
+
+  // Group purchases by supplier to process each supplier's account independently
+  const purchasesBySupplier = new Map<string, PurchaseModel[]>();
+  purchases.forEach((p, idx) => {
+    const key = p.supplierId || "unknown";
+    if (!purchasesBySupplier.has(key)) {
+      purchasesBySupplier.set(key, []);
+    }
+    purchasesBySupplier.get(key)!.push({ ...p, _tempIdx: idx } as any);
+  });
+
+  const updatedPurchasesMap = new Map<string | number, PurchaseModel>();
+
+  purchasesBySupplier.forEach((pList, supplierId) => {
+    // Sort oldest first (FIFO billing)
+    pList.sort((a, b) => {
+      const dateDiff = new Date(a.date).getTime() - new Date(b.date).getTime();
+      if (dateDiff !== 0) return dateDiff;
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return timeA - timeB;
+    });
+
+    const supplier = suppliers.find((s) => s.id === supplierId);
+    let opBal = supplier?.openingBalance || 0;
+
+    const payPool = supplierPaymentsMap.get(supplierId) || 0;
+    const retPool = supplierReturnsMap.get(supplierId) || 0;
+    let totalPool = payPool + retPool;
+
+    // Deduct the pool to clear supplier's opening balance first (if any)
+    if (opBal > 0) {
+      if (totalPool >= opBal) {
+        totalPool -= opBal;
+        opBal = 0;
+      } else {
+        opBal -= totalPool;
+        totalPool = 0;
+      }
+    }
+
+    // Now distribute remaining payment pool across purchases chronologically (FIFO)
+    pList.forEach((p) => {
+      // If we have general payments left, apply them to reduce purchase due amount
+      if (totalPool > 0) {
+        const origDue = p.dueAmount || 0;
+        if (totalPool >= origDue) {
+          totalPool -= origDue;
+          p.paidAmount = Math.min(p.totalAmount, (p.paidAmount || 0) + origDue);
+          p.dueAmount = 0;
+        } else {
+          p.paidAmount = Math.min(p.totalAmount, (p.paidAmount || 0) + totalPool);
+          p.dueAmount = Math.max(0, origDue - totalPool);
+          totalPool = 0;
+        }
+      }
+      const mapKey = p.id || (p as any)._tempIdx;
+      updatedPurchasesMap.set(mapKey, p);
+    });
+  });
+
+  // Re-map the original purchases back to retain their original presentation order
+  return purchases.map((originalPurchase, idx) => {
+    const key = originalPurchase.id || idx;
+    if (updatedPurchasesMap.has(key)) {
+      return updatedPurchasesMap.get(key)!;
+    }
+    return originalPurchase;
+  });
+}
+
+
+const NUMBN = ["০", "১", "২", "৩", "৪", "৫", "৬", "৭", "৮", "৯"];
+
+export function formatNumberDirect(num: number | string): string {
+  if (num === undefined || num === null) return "";
+  const str = String(num);
+  const isBn = typeof window !== "undefined" && localStorage.getItem("selected_language") === "bn";
+  if (!isBn) return str;
+  return str.replace(/[0-9]/g, (digit) => NUMBN[parseInt(digit, 10)]);
+}
+
+export function formatCurrency(amount: number) {
+  const value = typeof amount === "number" && !isNaN(amount) ? amount : 0;
+  const isBn = typeof window !== "undefined" && localStorage.getItem("selected_language") === "bn";
+  
+  const formattedEn = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(value);
+
+  if (isBn) {
+    return "৳" + formatNumberDirect(formattedEn);
+  }
+  return "৳" + formattedEn;
+}
+
+export function compressImage(
+  file: File,
+  maxWidth = 1000,
+  maxHeight = 1000,
+  quality = 0.75
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onerror = (err) => {
+        // Fallback to raw dataURL if image load fails
+        resolve(e.target?.result as string);
+      };
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+        if (height > maxHeight) {
+          width = Math.round((width * maxHeight) / height);
+          height = maxHeight;
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(e.target?.result as string);
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, width, height);
+        const compressedBase64 = canvas.toDataURL("image/jpeg", quality);
+        resolve(compressedBase64);
+      };
+      img.src = e.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Sorts suppliers naturally and number-wise from 1st to last (e.g. BD001, BD002, BD003 ... IND001, IND002 ...)
+ */
+export function sortSuppliersByCode(suppliersList: Supplier[]): Supplier[] {
+  if (!suppliersList || suppliersList.length === 0) return [];
+  return [...suppliersList].sort((a, b) => {
+    const codeA = (a.code || "").trim();
+    const codeB = (b.code || "").trim();
+
+    // Extract alphabet prefix and number, e.g. BD001 -> prefix: "BD", num: 1
+    const matchA = codeA.match(/^([a-zA-Z]+)\s*(\d+)$/);
+    const matchB = codeB.match(/^([a-zA-Z]+)\s*(\d+)$/);
+
+    if (matchA && matchB) {
+      const prefixCmp = matchA[1].toUpperCase().localeCompare(matchB[1].toUpperCase());
+      if (prefixCmp !== 0) {
+        return prefixCmp;
+      }
+      const numA = parseInt(matchA[2], 10);
+      const numB = parseInt(matchB[2], 10);
+      if (numA !== numB) {
+        return numA - numB;
+      }
+    }
+
+    if (codeA && codeB) {
+      const cmp = codeA.localeCompare(codeB, undefined, { numeric: true, sensitivity: "base" });
+      if (cmp !== 0) return cmp;
+    } else if (codeA) {
+      return -1;
+    } else if (codeB) {
+      return 1;
+    }
+
+    return (a.name || "").localeCompare(b.name || "");
+  });
+}

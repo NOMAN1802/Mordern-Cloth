@@ -1,0 +1,10 @@
+node_modules/
+build/
+dist/
+dist-parcel/
+.parcel-cache/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example

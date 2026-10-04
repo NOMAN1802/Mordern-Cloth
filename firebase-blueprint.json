@@ -1,0 +1,313 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "Staff member records",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "role": { "type": "string" },
+        "salary": { "type": "number" },
+        "joinedDate": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["active", "inactive"] }
+      },
+      "required": ["name", "role", "salary", "status"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Records of sales and expenses",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["income", "expense"] },
+        "category": { "type": "string" },
+        "subCategory": { "type": "string" },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "employeeId": { "type": "string" }
+      },
+      "required": ["date", "type", "category", "amount", "paymentMethod"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Transaction categories",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string", "enum": ["income", "expense"] },
+        "icon": { "type": "string" }
+      },
+      "required": ["name", "type"]
+    },
+    "Bank": {
+      "title": "Bank",
+      "description": "Bank account balances",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "balance": { "type": "number" },
+        "lastUpdated": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "balance"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User account and role information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "accountant", "sales"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "Supplier": {
+      "title": "Supplier",
+      "description": "Supplier records and balances",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "mobile": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "openingBalance": { "type": "number" },
+        "country": { "type": "string" },
+        "advanceAmount": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "purchaseDue": { "type": "number" },
+        "address": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "inactive"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "code", "country", "status"]
+    },
+    "SupplierTransaction": {
+      "title": "Supplier Transaction",
+      "description": "Purchases, returns, and payments logged for a supplier",
+      "type": "object",
+      "properties": {
+        "supplierId": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["purchase", "return", "payment"] },
+        "refNo": { "type": "string" },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "dueAmount": { "type": "number" },
+        "lessAmount": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["supplierId", "date", "type", "totalAmount"]
+    },
+    "Purchase": {
+      "title": "Purchase",
+      "description": "Manual purchase records",
+      "type": "object",
+      "properties": {
+        "supplierId": { "type": "string" },
+        "supplierName": { "type": "string" },
+        "date": { "type": "string" },
+        "refNo": { "type": "string" },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "dueAmount": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "notes": { "type": "string" },
+        "invoicePhoto": { "type": "string" },
+        "items": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["supplierId", "supplierName", "date", "refNo", "totalAmount", "paidAmount", "dueAmount", "paymentMethod", "createdAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Inventory product records",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "subCategory": { "type": "string" },
+        "unit": { "type": "string" },
+        "stock": { "type": "number" },
+        "lastPurchasePrice": { "type": "number" },
+        "totalPurchaseValue": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "stock", "lastPurchasePrice", "totalPurchaseValue"]
+    },
+    "StockLedgerEntry": {
+      "title": "Stock Ledger Entry",
+      "description": "Inventory change log records",
+      "type": "object",
+      "properties": {
+        "productId": { "type": "string" },
+        "productName": { "type": "string" },
+        "date": { "type": "string" },
+        "type": { "type": "string", "enum": ["purchase", "sale", "return", "adjustment"] },
+        "refNo": { "type": "string" },
+        "quantity": { "type": "number" },
+        "unit": { "type": "string" },
+        "unitPrice": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "supplierId": { "type": "string" },
+        "supplierName": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["productId", "productName", "date", "type", "refNo", "quantity", "unit", "unitPrice", "totalAmount", "createdAt"]
+    },
+    "Department": {
+      "title": "Department",
+      "description": "Company departments list",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" }
+      },
+      "required": ["name"]
+    },
+    "CounterSale": {
+      "title": "Counter Sale",
+      "description": "Fast counter sales slip entries and daily balancing",
+      "type": "object",
+      "properties": {
+        "saleId": { "type": "string" },
+        "dateTime": { "type": "string", "format": "date-time" },
+        "date": { "type": "string" },
+        "time": { "type": "string" },
+        "slips": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "slipNo": { "type": "number" },
+              "amount": { "type": "number" },
+              "notes": { "type": "string" }
+            },
+            "required": ["slipNo", "amount"]
+          }
+        },
+        "totalSlipsAmount": { "type": "number" },
+        "discountType": { "type": "string", "enum": ["amount", "percent"] },
+        "discountPercent": { "type": "number" },
+        "discountAmount": { "type": "number" },
+        "netPayable": { "type": "number" },
+        "receivedAmount": { "type": "number" },
+        "changeAmount": { "type": "number" },
+        "dueAmount": { "type": "number" },
+        "isBalanced": { "type": "boolean" },
+        "balanceStatus": { "type": "string", "enum": ["equal", "short", "excess"] },
+        "paymentMethod": { "type": "string" },
+        "customerId": { "type": "string" },
+        "dailySerial": { "type": "number" },
+        "customerName": { "type": "string" },
+        "customerPhone": { "type": "string" },
+        "customerAddress": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "transactionId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["saleId", "dateTime", "date", "slips", "totalSlipsAmount", "receivedAmount", "isBalanced", "paymentMethod", "createdBy", "createdAt"]
+    },
+    "CustomerProfile": {
+      "title": "Customer Profile",
+      "description": "Counter customer profile, due accounts and ledger history",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "address": { "type": "string" },
+        "totalPurchases": { "type": "number" },
+        "totalPaid": { "type": "number" },
+        "totalDue": { "type": "number" },
+        "totalDiscount": { "type": "number" },
+        "lastTransactionDate": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "totalPurchases", "totalPaid", "totalDue", "totalDiscount", "createdAt", "updatedAt"]
+    },
+    "CustomerPayment": {
+      "title": "Customer Payment",
+      "description": "Due payment collections logged from counter customers",
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "customerName": { "type": "string" },
+        "customerPhone": { "type": "string" },
+        "date": { "type": "string" },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "notes": { "type": "string" },
+        "receivedBy": { "type": "string" },
+        "transactionId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["customerId", "customerName", "date", "amount", "paymentMethod", "receivedBy", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/customers/{customerId}": {
+      "schema": "CustomerProfile",
+      "description": "Counter customer profiles and due balances"
+    },
+    "/customerPayments/{paymentId}": {
+      "schema": "CustomerPayment",
+      "description": "Due payment collections from customers"
+    },
+    "/counterSales/{saleId}": {
+      "schema": "CounterSale",
+      "description": "Slip-by-slip counter sales entries"
+    },
+    "/products/{productId}": {
+      "schema": "Product",
+      "description": "Inventory product stock balances"
+    },
+    "/stockLedger/{ledgerId}": {
+      "schema": "StockLedgerEntry",
+      "description": "Ledger of stock changes"
+    },
+    "/departments/{departmentId}": {
+      "schema": "Department",
+      "description": "Departments registry"
+    },
+    "/purchases/{purchaseId}": {
+      "schema": "Purchase",
+      "description": "Historical purchases registry"
+    },
+    "/suppliers/{supplierId}": {
+      "schema": "Supplier",
+      "description": "Supplier accounts registry"
+    },
+    "/supplierTransactions/{transactionId}": {
+      "schema": "SupplierTransaction",
+      "description": "Transaction log entries for suppliers"
+    },
+    "/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "Sales and expense records"
+    },
+    "/employees/{employeeId}": {
+      "schema": "Employee",
+      "description": "Staff member records"
+    },
+    "/categories/{categoryId}": {
+      "schema": "Category",
+      "description": "Master list of categories"
+    },
+    "/banks/{bankId}": {
+      "schema": "Bank",
+      "description": "Bank and account balances"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles and roles"
+    }
+  }
+}

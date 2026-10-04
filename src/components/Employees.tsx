@@ -1,0 +1,2650 @@
+import React, { useState, useEffect } from "react";
+import { User } from "firebase/auth";
+import { collection, onSnapshot, addDoc, deleteDoc, doc, query, orderBy, where, getDocs } from "firebase/firestore";
+import { db, OperationType, handleFirestoreError, updateDoc } from "@/src/lib/firebase";
+import { Employee, Transaction, UserRole, Bank } from "@/src/types";
+import { cn, formatCurrency, compressImage } from "@/src/lib/utils";
+import { Users, Plus, Trash2, UserPlus, CreditCard, History, Wallet, UserCircle, Landmark, X, FileText, FilePlus, Image, Eye, Pencil, ExternalLink, Download, ShieldCheck, Printer, FileDown, Loader2, CheckCircle2, AlertCircle, Coins, Lock, Crown } from "lucide-react";
+import { format, startOfYear, endOfYear } from "date-fns";
+import { increment, setDoc } from "firebase/firestore";
+import { motion, AnimatePresence } from "motion/react";
+
+export default function Employees({ 
+  user, 
+  role,
+  mode = "list",
+  onSuccess
+}: { 
+  user: User; 
+  role: UserRole; 
+  mode?: "new" | "list";
+  onSuccess?: () => void;
+}) {
+  const normalizedRole = (role || "").toLowerCase().trim();
+  const isSuperAdmin = 
+    normalizedRole === "super_admin" ||
+    normalizedRole === "superadmin" ||
+    normalizedRole === "super admin" ||
+    normalizedRole.includes("super") ||
+    normalizedRole === "admin" ||
+    normalizedRole.includes("administrator") ||
+    user?.email?.toLowerCase() === "modern@admin.com";
+
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [banks, setBanks] = useState<Bank[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Form State
+  const [name, setName] = useState("");
+  const [empRole, setEmpRole] = useState("");
+  const [salary, setSalary] = useState("");
+  const [status, setStatus] = useState<"active" | "inactive">("active");
+  const [department, setDepartment] = useState("Sales");
+  const [employeeDocuments, setEmployeeDocuments] = useState<{ name: string; type: string; data: string }[]>([]);
+  const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState("");
+  const [nidFrontPhoto, setNidFrontPhoto] = useState<string | null>(null);
+  const [nidBackPhoto, setNidBackPhoto] = useState<string | null>(null);
+  const [birthCertificatePhoto, setBirthCertificatePhoto] = useState<string | null>(null);
+  const [showForm, setShowForm] = useState(mode === "new");
+  const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
+  const [viewingProfile, setViewingProfile] = useState<Employee | null>(null);
+  const [viewingAttendance, setViewingAttendance] = useState<Employee | null>(null);
+
+  // Form Saving & Compression States
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isCompressing, setIsCompressing] = useState(false);
+
+  // Profile Detail Extra states
+  const [profileTab, setProfileTab] = useState<"kyc" | "attendance" | "financial">("kyc");
+  const [profileAttendance, setProfileAttendance] = useState<any[]>([]);
+  const [loadingProfileAttendance, setLoadingProfileAttendance] = useState(false);
+  const [lunchDurationLimit, setLunchDurationLimit] = useState(60);
+
+  const getLunchDurationMinutes = (lunchOut?: string, lunchIn?: string): number => {
+    if (!lunchOut || !lunchIn) return 0;
+    try {
+      const [outH, outM] = lunchOut.split(":").map(Number);
+      const [inH, inM] = lunchIn.split(":").map(Number);
+      if (isNaN(outH) || isNaN(outM) || isNaN(inH) || isNaN(inM)) return 0;
+      return (inH * 60 + inM) - (outH * 60 + outM);
+    } catch {
+      return 0;
+    }
+  };
+
+  // Load attendance rules
+  useEffect(() => {
+    const unsubRules = onSnapshot(doc(db, "settings", "attendance"), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setLunchDurationLimit(data.lunchDurationLimit ?? 60);
+      }
+    });
+    return () => unsubRules();
+  }, []);
+
+  // Fetch full continuous attendance history for the selected employee
+  useEffect(() => {
+    if (viewingProfile) {
+      setProfileTab("kyc");
+      setLoadingProfileAttendance(true);
+      const q = query(
+        collection(db, "attendance"),
+        where("employeeId", "==", viewingProfile.id),
+        orderBy("date", "desc")
+      );
+      getDocs(q).then(snap => {
+        setProfileAttendance(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+        setLoadingProfileAttendance(false);
+      }).catch(err => {
+        console.error("Error loaded profile attendance", err);
+        setLoadingProfileAttendance(false);
+      });
+    } else {
+      setProfileAttendance([]);
+    }
+  }, [viewingProfile]);
+  const [showImport, setShowImport] = useState(false);
+  const [importText, setImportText] = useState("");
+
+  const [employeeIdCode, setEmployeeIdCode] = useState("");
+  const [idPrefix, setIdPrefix] = useState("MCS");
+  const [customDepts, setCustomDepts] = useState<{ id?: string; name: string }[]>([]);
+
+  // Deletion Confirmation State
+  const [employeeToDelete, setEmployeeToDelete] = useState<string | null>(null);
+
+  // Dynamic Branding
+  const [companyName, setCompanyName] = useState("Modern Pro");
+
+  // Quick Pay State
+  const [quickPay, setQuickPay] = useState<{ empId: string; type: "Staff Salary" | "Employee Advance" } | null>(null);
+  const [payAmount, setPayAmount] = useState("");
+  const [payMethod, setPayMethod] = useState("Cash");
+  const [payNotes, setPayNotes] = useState("");
+  const [isPaying, setIsPaying] = useState(false);
+
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "employees"), (snap) => {
+      const list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Employee));
+      list.sort((a, b) => {
+        const dateA = a.joinedDate ? new Date(a.joinedDate).getTime() : 0;
+        const dateB = b.joinedDate ? new Date(b.joinedDate).getTime() : 0;
+        if (dateA !== dateB) return dateA - dateB;
+        return (a.name || "").localeCompare(b.name || "");
+      });
+      setEmployees(list);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, "employees"));
+
+    // Also fetch all transactions linked to employees
+    const qTx = query(collection(db, "transactions"), where("employeeId", "!=", null));
+    const unsubTx = onSnapshot(qTx, (snap) => {
+      setTransactions(snap.docs.map(d => ({ id: d.id, ...d.data() } as Transaction)));
+      setLoading(false);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, "transactions"));
+
+    const unsubBanks = onSnapshot(collection(db, "banks"), (snap) => {
+      setBanks(snap.docs.map(d => ({ id: d.id, ...d.data() } as Bank)));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, "banks"));
+
+    const unsubIdSettings = onSnapshot(doc(db, "settings", "employeeId"), (docSnap) => {
+      if (docSnap.exists()) {
+        setIdPrefix(docSnap.data().prefix || "MCS");
+      }
+    });
+
+    const unsubDepts = onSnapshot(collection(db, "departments"), (snap) => {
+      setCustomDepts(snap.docs.map(d => ({ id: d.id, name: d.data().name as string })));
+    });
+
+    const unsubCompany = onSnapshot(doc(db, "settings", "company"), (docSnap) => {
+      if (docSnap.exists()) {
+        setCompanyName(docSnap.data().companyName || "Modern Pro");
+      }
+    });
+
+    return () => { 
+      unsub(); 
+      unsubTx(); 
+      unsubBanks(); 
+      unsubIdSettings();
+      unsubDepts();
+      unsubCompany();
+    };
+  }, []);
+
+  // Sync / Suggest Next Employee ID sequentially
+  useEffect(() => {
+    if (showForm && !editingEmployee) {
+      const prefix = idPrefix.trim() || "MCS";
+      const matchingIds = employees
+        .map(e => e.employeeIdCode || "")
+        .filter(id => id.toUpperCase().startsWith(prefix.toUpperCase()));
+      
+      let maxNum = -1;
+      matchingIds.forEach(id => {
+        const numPart = id.substring(prefix.length).trim();
+        const num = parseInt(numPart, 10);
+        if (!isNaN(num) && num > maxNum) {
+          maxNum = num;
+        }
+      });
+      
+      const nextNum = maxNum + 1;
+      const formattedNum = nextNum < 10 ? `0${nextNum}` : `${nextNum}`;
+      setEmployeeIdCode(`${prefix} ${formattedNum}`);
+    }
+  }, [showForm, editingEmployee, employees, idPrefix]);
+
+  // Handle dynamic default departments
+  useEffect(() => {
+    if (showForm && !editingEmployee) {
+      if (customDepts.length > 0) {
+        setDepartment(customDepts[0].name);
+      } else {
+        setDepartment("Sales");
+      }
+    }
+  }, [showForm, editingEmployee, customDepts]);
+
+  const handleBulkImport = async () => {
+    if (!importText) return;
+    const lines = importText.split("\n").filter(l => l.trim());
+    let imported = 0;
+    try {
+      for (const line of lines) {
+        const [name, role, salary] = line.split(",").map(s => s.trim());
+        if (name && role && salary) {
+          await addDoc(collection(db, "employees"), {
+            name,
+            role,
+            salary: isSuperAdmin ? (parseFloat(salary) || 0) : 0,
+            joinedDate: new Date().toISOString(),
+            status: "active"
+          });
+          imported++;
+        }
+      }
+      alert(`Imported ${imported} employees successfully.${!isSuperAdmin ? " (Note: Employee salary can only be set or modified by SUPER Admin.)" : ""}`);
+      setImportText("");
+      setShowImport(false);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.CREATE, "employees");
+    }
+  };
+
+  const handleQuickPay = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!quickPay || !payAmount) return;
+    setIsPaying(true);
+    try {
+      const amount = parseFloat(payAmount);
+      const emp = employees.find(e => e.id === quickPay.empId);
+      const newTx = {
+        date: new Date().toISOString(),
+        type: "expense" as const,
+        category: quickPay.type,
+        amount: amount,
+        paymentMethod: payMethod,
+        notes: payNotes,
+        createdBy: user.uid,
+        employeeId: quickPay.empId,
+        subCategory: emp?.name || ""
+      };
+
+      await addDoc(collection(db, "transactions"), newTx);
+
+      if (payMethod !== "Cash") {
+        const bank = banks.find(b => b.name === payMethod);
+        if (bank?.id) {
+          await updateDoc(doc(db, "banks", bank.id), {
+            balance: increment(-amount),
+            lastUpdated: new Date().toISOString()
+          });
+        }
+      }
+
+      setQuickPay(null);
+      setPayAmount("");
+      setPayNotes("");
+      setPayMethod("Cash");
+    } catch (e) {
+      handleFirestoreError(e, OperationType.CREATE, "transactions");
+    } finally {
+      setIsPaying(false);
+    }
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setIsCompressing(true);
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.type.startsWith('image/')) {
+          const compressedData = await compressImage(file, 1000, 1000, 0.75);
+          setEmployeeDocuments(prev => [...prev, {
+            name: file.name,
+            type: file.type,
+            data: compressedData
+          }]);
+        } else {
+          if (file.size > 700 * 1024) {
+            alert("File is too large! Please upload a PDF smaller than 700KB.");
+            continue;
+          }
+          const reader = new FileReader();
+          await new Promise<void>((resolve) => {
+            reader.onloadend = () => {
+              setEmployeeDocuments(prev => [...prev, {
+                name: file.name,
+                type: file.type,
+                data: reader.result as string
+              }]);
+              resolve();
+            };
+            reader.readAsDataURL(file);
+          });
+        }
+      }
+    } catch (err) {
+      console.error("Error processing documents:", err);
+    } finally {
+      setIsCompressing(false);
+      e.target.value = "";
+    }
+  };
+
+  const removeDocument = (index: number) => {
+    setEmployeeDocuments(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>, target: "nidFront" | "nidBack" | "birth") => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsCompressing(true);
+    try {
+      const compressedData = await compressImage(file, 1000, 1000, 0.75);
+      if (target === "nidFront") setNidFrontPhoto(compressedData);
+      else if (target === "nidBack") setNidBackPhoto(compressedData);
+      else if (target === "birth") setBirthCertificatePhoto(compressedData);
+    } catch (err) {
+      console.error("Failed to compress photo:", err);
+      alert("Failed to process photo.");
+    } finally {
+      setIsCompressing(false);
+      e.target.value = "";
+    }
+  };
+
+  const handleAddEmployee = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+
+    setIsSaving(true);
+    setSaveError(null);
+
+    try {
+      const employeeData: any = {
+        name: name.trim(),
+        role: empRole || "",
+        status: status,
+        department: department,
+        documents: employeeDocuments,
+        phone: phone.trim(),
+        email: email.trim(),
+        nidFrontPhoto,
+        nidBackPhoto,
+        birthCertificatePhoto,
+        employeeIdCode: employeeIdCode.trim(),
+        joinedDate: editingEmployee?.joinedDate || new Date().toISOString()
+      };
+
+      // Enforce: Edit employees' salary input ONLY SUPER Admin
+      if (!isSuperAdmin) {
+        // Non-super-admins cannot set or change salary
+        employeeData.salary = editingEmployee ? (editingEmployee.salary || 0) : 0;
+      } else {
+        employeeData.salary = salary ? parseFloat(salary) : 0;
+      }
+
+      if (editingEmployee?.id) {
+        await updateDoc(doc(db, "employees", editingEmployee.id), employeeData);
+      } else {
+        await addDoc(collection(db, "employees"), employeeData);
+      }
+      
+      resetForm();
+      if (onSuccess) {
+        onSuccess();
+      }
+    } catch (e: any) {
+      console.error("Error saving employee to Firestore:", e);
+      let msg = "Failed to save employee profile. ";
+      if (e?.message?.includes("exceeds maximum size") || e?.code === "invalid-argument") {
+        msg += "Attached images or files are too large for database limits. Please remove or re-upload smaller images.";
+      } else {
+        msg += e?.message || "Please check database connection and try again.";
+      }
+      setSaveError(msg);
+      handleFirestoreError(e, editingEmployee ? OperationType.UPDATE : OperationType.CREATE, "employees");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const resetForm = () => {
+    setName("");
+    setEmpRole("");
+    setSalary("");
+    setStatus("active");
+    setDepartment("Sales");
+    setEmployeeDocuments([]);
+    setPhone("");
+    setEmail("");
+    setNidFrontPhoto(null);
+    setNidBackPhoto(null);
+    setBirthCertificatePhoto(null);
+    setEmployeeIdCode("");
+    setShowForm(mode === "new");
+    setEditingEmployee(null);
+    setSaveError(null);
+    setIsSaving(false);
+    setIsCompressing(false);
+  };
+
+  const startEdit = (emp: Employee) => {
+    setEditingEmployee(emp);
+    setName(emp.name || "");
+    setEmpRole(emp.role || "");
+    setSalary((emp.salary ?? 0).toString());
+    setStatus(emp.status || "active");
+    setDepartment(emp.department || "Sales");
+    setEmployeeDocuments(emp.documents || []);
+    setPhone(emp.phone || "");
+    setEmail(emp.email || "");
+    setNidFrontPhoto(emp.nidFrontPhoto || null);
+    setNidBackPhoto(emp.nidBackPhoto || null);
+    setBirthCertificatePhoto(emp.birthCertificatePhoto || null);
+    setEmployeeIdCode(emp.employeeIdCode || "");
+    setSaveError(null);
+    setShowForm(true);
+  };
+
+  const confirmDeleteEmployee = async () => {
+    if (!employeeToDelete) return;
+    const id = employeeToDelete;
+    setEmployeeToDelete(null);
+    try {
+      await deleteDoc(doc(db, "employees", id));
+    } catch (e) {
+      handleFirestoreError(e, OperationType.DELETE, "employees");
+    }
+  };
+
+  const getEmployeeStats = (empId: string) => {
+    const empTxs = transactions.filter(tx => tx.employeeId === empId);
+    const totalPaid = empTxs
+      .filter(tx => tx.category === "Staff Salary")
+      .reduce((sum, tx) => sum + tx.amount, 0);
+    const totalAdvance = empTxs
+      .filter(tx => tx.category === "Employee Advance")
+      .reduce((sum, tx) => sum + tx.amount, 0);
+    
+    return { totalPaid, totalAdvance };
+  };
+
+  const handlePrintProfile = (emp: Employee) => {
+    const stats = getEmployeeStats(emp.id!);
+    const joinedStr = emp.joinedDate ? format(new Date(emp.joinedDate), "MMMM dd, yyyy") : "N/A";
+    const formatCurrJS = (amount: number) => {
+      return new Intl.NumberFormat("en-BD", { style: "currency", currency: "BDT" }).format(amount);
+    };
+
+    const iframe = document.createElement("iframe");
+    iframe.style.position = "absolute";
+    iframe.style.width = "0px";
+    iframe.style.height = "0px";
+    iframe.style.border = "none";
+    iframe.style.top = "-9999px";
+    document.body.appendChild(iframe);
+
+    const docToWrite = iframe.contentWindow?.document;
+    if (!docToWrite) return;
+
+    const nidFrontHtml = emp.nidFrontPhoto 
+      ? `<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center">
+           <h4 class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">NID Card Front</h4>
+           <div class="h-40 flex items-center justify-center bg-white rounded-lg border border-slate-100 overflow-hidden">
+             <img src="${emp.nidFrontPhoto}" alt="NID Front" class="max-h-full max-w-full object-contain p-1" />
+           </div>
+         </div>`
+      : `<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center flex flex-col justify-center items-center h-48">
+           <span class="text-xs text-slate-400 italic">No Front NID Uploaded</span>
+         </div>`;
+
+    const nidBackHtml = emp.nidBackPhoto 
+      ? `<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center">
+           <h4 class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">NID Card Back</h4>
+           <div class="h-40 flex items-center justify-center bg-white rounded-lg border border-slate-100 overflow-hidden">
+             <img src="${emp.nidBackPhoto}" alt="NID Back" class="max-h-full max-w-full object-contain p-1" />
+           </div>
+         </div>`
+      : `<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center flex flex-col justify-center items-center h-48">
+           <span class="text-xs text-slate-400 italic">No Back NID Uploaded</span>
+         </div>`;
+
+    const birthCertHtml = emp.birthCertificatePhoto 
+      ? `<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center">
+           <h4 class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Birth Certificate</h4>
+           <div class="h-40 flex items-center justify-center bg-white rounded-lg border border-slate-100 overflow-hidden">
+             <img src="${emp.birthCertificatePhoto}" alt="Birth Certificate" class="max-h-full max-w-full object-contain p-1" />
+           </div>
+         </div>`
+      : `<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center flex flex-col justify-center items-center h-48">
+           <span class="text-xs text-slate-400 italic">No Birth Certificate Uploaded</span>
+         </div>`;
+
+    const imageHtml = emp.documents?.find(d => d.type.startsWith('image/'))
+      ? `<img src="${emp.documents.find(d => d.type.startsWith('image/'))?.data}" class="w-full h-full object-cover" />`
+      : `<svg class="w-12 h-12 text-slate-300 mx-auto" fill="currentColor" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>`;
+
+    const financialHtml = 
+      `<div class="mb-8">
+          <h3 class="text-base font-extrabold text-slate-900 mb-4 border-b border-slate-100 pb-2">Financial Account Statement</h3>
+          <div class="grid grid-cols-3 gap-4">
+            <div class="border border-slate-200 p-4 rounded-xl text-center bg-slate-50">
+              <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Contracted Monthly Salary</p>
+              <p class="text-base font-black text-slate-900 font-mono">${formatCurrJS(emp.salary || 0)}</p>
+            </div>
+            <div class="border border-slate-200 p-4 rounded-xl text-center bg-emerald-50/50">
+              <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Total Paid To Date</p>
+              <p class="text-base font-black text-emerald-700 font-mono">${formatCurrJS(stats.totalPaid)}</p>
+            </div>
+            <div class="border border-slate-200 p-4 rounded-xl text-center bg-amber-50/50">
+              <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Advance Balance Due</p>
+              <p class="text-base font-black text-amber-700 font-mono">${formatCurrJS(stats.totalAdvance)}</p>
+            </div>
+          </div>
+        </div>`;
+
+    docToWrite.write(`
+      <html>
+        <head>
+          <title>${emp.name} - Official Personnel Record</title>
+          <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+          <script src="https://cdn.tailwindcss.com"></script>
+          <style>
+            @media print {
+              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+              @page { size: portrait; margin: 15mm; }
+            }
+            body, html, * {
+              font-family: 'Hind Siliguri', 'Noto Sans Bengali', 'Inter', sans-serif !important;
+              text-rendering: optimizeLegibility !important;
+              -webkit-font-smoothing: antialiased !important;
+              font-feature-settings: "liga" 1, "clig" 1, "calt" 1 !important;
+            }
+          </style>
+        </head>
+        <body class="bg-white text-slate-800 p-8">
+          <div class="max-w-4xl mx-auto border border-slate-200 rounded-3xl p-10 bg-white shadow-sm">
+            <!-- Company / Roster Header -->
+            <div class="flex justify-between items-start border-b border-slate-200 pb-8 mb-8">
+              <div>
+                <h1 class="text-3xl font-black text-slate-900 tracking-tight mb-1">${companyName}</h1>
+                <p class="text-xs font-bold text-slate-400 uppercase tracking-widest">OFFICIAL PERSONNEL FILE</p>
+                <p class="text-[10px] text-slate-400 mt-1">Generated: ${format(new Date(), "MMMM dd, yyyy - hh:mm a")}</p>
+              </div>
+              <div class="w-24 h-24 bg-slate-100 rounded-2xl flex items-center justify-center border border-slate-200 overflow-hidden shadow-inner">
+                ${imageHtml}
+              </div>
+            </div>
+
+            <!-- Profile Summary Title -->
+            <div class="mb-6 flex justify-between items-center">
+              <h2 class="text-xl font-extrabold text-slate-950">Employee Information Details</h2>
+              <span class="px-4 py-1.5 bg-blue-100 text-blue-800 rounded-full text-xs font-extrabold uppercase tracking-widest">${emp.status}</span>
+            </div>
+
+            <!-- Profile Grid -->
+            <div class="grid grid-cols-2 gap-y-6 gap-x-8 border border-slate-100 bg-slate-50/50 rounded-2xl p-6 mb-8 text-sm">
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Full Name</span>
+                <span class="font-extrabold text-slate-900 text-base">${emp.name}</span>
+              </div>
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Employee ID</span>
+                <span class="font-black text-blue-600 text-base font-mono">${emp.employeeIdCode || "N/A"}</span>
+              </div>
+              
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Designation / Role</span>
+                <span class="font-extrabold text-slate-800">${emp.role || "N/A"}</span>
+              </div>
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Department</span>
+                <span class="font-bold text-slate-700">${emp.department || "Sales"}</span>
+              </div>
+
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Phone Number</span>
+                <span class="font-bold text-slate-800">${emp.phone || "N/A"}</span>
+              </div>
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Email</span>
+                <span class="font-bold text-slate-700">${emp.email || "N/A"}</span>
+              </div>
+
+              <div>
+                <span class="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Date of Joining</span>
+                <span class="font-bold text-slate-700">${joinedStr}</span>
+              </div>
+            </div>
+
+            <!-- Financial Records Ledger -->
+            ${financialHtml}
+
+            <!-- KYC Verification Documents -->
+            <div class="mb-10 page-break-inside-avoid">
+              <h3 class="text-base font-extrabold text-slate-900 mb-4 border-b border-slate-100 pb-2">KYC Documentation & Proofs</h3>
+              <div class="grid grid-cols-3 gap-4">
+                ${nidFrontHtml}
+                ${nidBackHtml}
+                ${birthCertHtml}
+              </div>
+            </div>
+
+            <!-- Official Signatures -->
+            <div class="mt-16 pt-8 border-t border-dashed border-slate-300 flex justify-between text-xs font-bold text-slate-500 page-break-inside-avoid">
+              <div class="text-center w-40">
+                <div class="border-b border-slate-400 h-10 mb-2"></div>
+                <p>Prepared By</p>
+                <p class="text-[10px] font-medium text-slate-400">HR Executive</p>
+              </div>
+              <div class="text-center w-40">
+                <div class="border-b border-slate-400 h-10 mb-2"></div>
+                <p>Verified By</p>
+                <p class="text-[10px] font-medium text-slate-400">Finance Manager</p>
+              </div>
+              <div class="text-center w-40">
+                <div class="border-b border-slate-400 h-10 mb-2"></div>
+                <p>Approved By</p>
+                <p class="text-[10px] font-medium text-slate-400">Director / CEO</p>
+              </div>
+            </div>
+          </div>
+
+          <script>
+            window.onload = function() {
+              setTimeout(function() {
+                window.print();
+                setTimeout(function() {
+                  window.parent.document.body.removeChild(window.frameElement);
+                }, 100);
+              }, 800);
+            };
+          </script>
+        </body>
+      </html>
+    `);
+    docToWrite.close();
+  };
+
+  const handlePrintRoster = () => {
+    const iframe = document.createElement("iframe");
+    iframe.style.position = "absolute";
+    iframe.style.width = "0px";
+    iframe.style.height = "0px";
+    iframe.style.border = "none";
+    iframe.style.top = "-9999px";
+    document.body.appendChild(iframe);
+
+    const docToWrite = iframe.contentWindow?.document;
+    if (!docToWrite) return;
+
+    const formatCurrJS = (amount: number) => {
+      return new Intl.NumberFormat("en-BD", { style: "currency", currency: "BDT" }).format(amount);
+    };
+
+    const tableRows = employees.map((emp, idx) => {
+      const stats = getEmployeeStats(emp.id!);
+      const joinedStr = emp.joinedDate ? format(new Date(emp.joinedDate), "MMM dd, yyyy") : "N/A";
+      const financialCells = 
+        `<td class="px-4 py-3 text-right font-mono font-black text-slate-950">${formatCurrJS(emp.salary || 0)}</td>
+         <td class="px-4 py-3 text-right font-mono text-emerald-700 font-black">${formatCurrJS(stats.totalPaid)}</td>
+         <td class="px-4 py-3 text-right font-mono text-amber-700 font-black">${formatCurrJS(stats.totalAdvance)}</td>`;
+
+      return `
+        <tr class="border-b border-slate-200 hover:bg-slate-50 transition-colors text-xs font-semibold text-slate-700">
+          <td class="px-4 py-3 text-slate-400 font-bold">${idx + 1}</td>
+          <td class="px-4 py-3 font-bold text-slate-900">${emp.employeeIdCode || "—"}</td>
+          <td class="px-4 py-3 font-black text-slate-900">${emp.name}</td>
+          <td class="px-4 py-3 font-extrabold text-slate-800">${emp.role || "—"}</td>
+          <td class="px-4 py-3 text-slate-600">${emp.department || "Sales"}</td>
+          <td class="px-4 py-3 text-slate-600 font-mono">${emp.phone || "—"}</td>
+          <td class="px-4 py-3 text-slate-600">${joinedStr}</td>
+          ${financialCells}
+          <td class="px-4 py-3 text-center">
+            <span class="px-2 py-0.5 rounded-full text-[9px] font-black uppercase leading-tight ${emp.status === 'active' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+              ${emp.status}
+            </span>
+          </td>
+        </tr>
+      `;
+    }).join("");
+
+    const grandTotalSalary = employees.reduce((total, emp) => total + (emp.salary || 0), 0);
+    const grandTotalPaid = employees.reduce((total, emp) => total + getEmployeeStats(emp.id!).totalPaid, 0);
+    const grandTotalAdvance = employees.reduce((total, emp) => total + getEmployeeStats(emp.id!).totalAdvance, 0);
+
+    const financialHeaders = 
+      `<th class="px-4 py-3 text-right">Basic Salary</th>
+       <th class="px-4 py-3 text-right">Total Paid</th>
+       <th class="px-4 py-3 text-right">Advance Balance</th>`;
+
+    const financialTotals = 
+      `<tr class="bg-slate-50 border-t-2 border-slate-300 font-extrabold text-xs text-slate-900">
+        <td colspan="7" class="px-4 py-4 text-right uppercase tracking-wider font-extrabold text-slate-500">Totals:</td>
+        <td class="px-4 py-4 text-right font-mono font-black text-slate-950">${formatCurrJS(grandTotalSalary)}</td>
+        <td class="px-4 py-4 text-right font-mono font-black text-green-700">${formatCurrJS(grandTotalPaid)}</td>
+        <td class="px-4 py-4 text-right font-mono font-black text-amber-700">${formatCurrJS(grandTotalAdvance)}</td>
+        <td></td>
+       </tr>`;
+
+    docToWrite.write(`
+      <html>
+        <head>
+          <title>Active Employee Roster - ${companyName}</title>
+          <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+          <script src="https://cdn.tailwindcss.com"></script>
+          <style>
+            @media print {
+              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+              @page { size: landscape; margin: 10mm; }
+            }
+            body, html, * {
+              font-family: 'Hind Siliguri', 'Noto Sans Bengali', 'Inter', sans-serif !important;
+              text-rendering: optimizeLegibility !important;
+              -webkit-font-smoothing: antialiased !important;
+              font-feature-settings: "liga" 1, "clig" 1, "calt" 1 !important;
+            }
+          </style>
+        </head>
+        <body class="bg-white text-slate-800 p-6">
+          <div class="max-w-[100%] mx-auto">
+            <!-- Header -->
+            <div class="flex justify-between items-end border-b-2 border-slate-300 pb-4 mb-6">
+              <div>
+                <h1 class="text-3xl font-black text-slate-900 tracking-tight">${companyName}</h1>
+                <h2 class="text-base font-bold text-slate-400 uppercase tracking-widest mt-1">OFFICIAL PERSONNEL & PAYROLL ROSTER</h2>
+              </div>
+              <div class="text-right text-xs text-slate-400">
+                <p>Generated: ${format(new Date(), "MMMM dd, yyyy hh:mm a")}</p>
+                <p>Total Count: <span class="font-extrabold text-slate-700">${employees.length} Staff Members</span></p>
+              </div>
+            </div>
+
+            <!-- Details Table -->
+            <table class="w-full text-left border-collapse">
+              <thead>
+                <tr class="bg-slate-100 border-b border-slate-300 text-[10px] font-black text-slate-400 uppercase tracking-wider">
+                  <th class="px-4 py-3">#</th>
+                  <th class="px-4 py-3">ID Code</th>
+                  <th class="px-4 py-3">Employee Name</th>
+                  <th class="px-4 py-3">Designation / Role</th>
+                  <th class="px-4 py-3">Department</th>
+                  <th class="px-4 py-3">Phone</th>
+                  <th class="px-4 py-3">Joined Date</th>
+                  ${financialHeaders}
+                  <th class="px-4 py-3 text-center">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${tableRows}
+                ${financialTotals}
+              </tbody>
+            </table>
+
+            <!-- Signatures line -->
+            <div class="mt-16 flex justify-between text-[11px] font-bold text-slate-500 page-break-inside-avoid">
+              <div class="text-center w-48">
+                <div class="border-b border-slate-300 h-10 mb-2"></div>
+                <p>Prepared By HR Office</p>
+              </div>
+              <div class="text-center w-48">
+                <div class="border-b border-slate-300 h-10 mb-2"></div>
+                <p>Audited By Finance Dept</p>
+              </div>
+              <div class="text-center w-48">
+                <div class="border-b border-slate-300 h-10 mb-2"></div>
+                <p>Authorized Signature</p>
+              </div>
+            </div>
+          </div>
+
+          <script>
+            window.onload = function() {
+              setTimeout(function() {
+                window.print();
+                setTimeout(function() {
+                  window.parent.document.body.removeChild(window.frameElement);
+                }, 100);
+              }, 800);
+            };
+          </script>
+        </body>
+      </html>
+    `);
+    docToWrite.close();
+  };
+
+  if (mode === "new") {
+    return (
+      <div className="space-y-8 animate-in fade-in duration-300">
+        <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-3xl font-black tracking-tight mb-1 text-gray-950">New Employee</h2>
+            <p className="text-sm text-gray-500 font-medium">Add a new staff member to the system.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => setShowImport(!showImport)}
+              className="bg-white border text-gray-700 hover:bg-gray-50 border-gray-200 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 transition-all active:scale-95 cursor-pointer"
+            >
+              <History className="w-5 h-5 text-gray-400" />
+              Bulk Import
+            </button>
+          </div>
+        </header>
+
+        {showImport && (
+          <div className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-xl max-w-2xl">
+            <div className="space-y-4">
+              <div>
+                <h3 className="text-lg font-bold">Bulk Import Employees</h3>
+                <p className="text-sm text-gray-500">Format: Name, Role, Salary (one per line)</p>
+              </div>
+              <textarea
+                placeholder="Joy Dutta, Manager, 25000&#10;Rahim Ali, Sales, 15000"
+                value={importText}
+                onChange={e => setImportText(e.target.value)}
+                className="w-full h-48 px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-mono text-sm"
+              />
+              <div className="flex gap-4">
+                <button 
+                  onClick={handleBulkImport}
+                  className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all cursor-pointer"
+                >
+                  Import List
+                </button>
+                <button 
+                  onClick={() => setShowImport(false)}
+                  className="px-8 py-4 bg-gray-100 text-gray-600 rounded-2xl font-bold hover:bg-gray-200 transition-all cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-xl max-w-4xl"
+        >
+          <h3 className="text-xl font-bold mb-6 flex items-center gap-2">
+            <UserPlus className="w-5 h-5 text-gray-400" />
+            New Employee Registration
+          </h3>
+          <form onSubmit={handleAddEmployee} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1 flex items-center gap-1.5">
+                Employee ID
+                <span className="text-[9px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded font-mono">Auto generated</span>
+              </label>
+              <input 
+                placeholder="e.g. MCS 01"
+                value={employeeIdCode}
+                onChange={e => setEmployeeIdCode(e.target.value)}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-bold font-mono"
+              />
+            </div>
+            <div className="space-y-1.5 md:col-span-2 lg:col-span-2">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Full Name *</label>
+              <input 
+                required
+                placeholder="Employee Name"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Phone Number</label>
+              <input 
+                type="tel"
+                placeholder="e.g. 017XXXXXXXX"
+                value={phone}
+                onChange={e => setPhone(e.target.value)}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium font-mono"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Email Address</label>
+              <input 
+                type="email"
+                placeholder="e.g. employee@company.com"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Designation / Role</label>
+              <input 
+                placeholder="e.g. Sales Officer, Manager"
+                value={empRole}
+                onChange={e => setEmpRole(e.target.value)}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between pl-1">
+                <label className="text-xs font-bold text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
+                  <span>Monthly Salary (BDT)</span>
+                  {isSuperAdmin ? (
+                    <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 border border-emerald-300 px-2 py-0.5 rounded-full flex items-center gap-1">
+                      <Crown className="w-3 h-3 text-amber-500" /> Super Admin
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-bold text-slate-500 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-full flex items-center gap-1">
+                      <Lock className="w-3 h-3 text-slate-400" /> Super Admin Only
+                    </span>
+                  )}
+                </label>
+              </div>
+
+              {isSuperAdmin ? (
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 font-black font-mono text-emerald-600 text-lg">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="any"
+                    placeholder="0.00"
+                    value={salary}
+                    onChange={e => setSalary(e.target.value)}
+                    className="w-full pl-9 pr-4 py-4 bg-emerald-50/20 border-2 border-emerald-300/80 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-100 rounded-2xl font-black font-mono text-lg text-slate-900 transition-all outline-none"
+                  />
+                </div>
+              ) : (
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 font-bold font-mono text-slate-400 text-lg">৳</span>
+                  <input 
+                    type="text"
+                    disabled
+                    readOnly
+                    value="Protected (সুপার এডমিন অনুমতি আবশ্যক)"
+                    className="w-full pl-9 pr-4 py-4 bg-slate-100/90 border border-slate-200 rounded-2xl font-bold font-mono text-sm text-slate-500 cursor-not-allowed select-none outline-none"
+                  />
+                </div>
+              )}
+              <p className="text-[11px] text-slate-500 pl-1">
+                {isSuperAdmin 
+                  ? "কর্মীর মাসিক মূল বেতন (সুপার এডমিন নিয়ন্ত্রণ)" 
+                  : "🔒 শুধুমাত্র সুপার এডমিন (SUPER Admin) নতুন কর্মীর বেতন নির্ধারণ করতে পারবেন।"}
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Employment Status</label>
+              <select
+                value={status}
+                onChange={e => setStatus(e.target.value as "active" | "inactive")}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium font-bold outline-none cursor-pointer"
+              >
+                <option value="active">Active Staff</option>
+                <option value="inactive">Resigned / Inactive</option>
+              </select>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Department</label>
+              <select
+                value={department}
+                onChange={e => setDepartment(e.target.value)}
+                className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium font-bold outline-none cursor-pointer"
+              >
+                {customDepts.length > 0 ? (
+                  customDepts.map(d => (
+                    <option key={d.id || d.name} value={d.name}>{d.name}</option>
+                  ))
+                ) : (
+                  <>
+                    <option value="Sales">Sales</option>
+                    <option value="Accounts">Accounts</option>
+                    <option value="Marketing">Marketing</option>
+                    <option value="IT / Support">IT / Support</option>
+                    <option value="Management">Management</option>
+                    <option value="Delivery">Delivery</option>
+                    <option value="Others">Others</option>
+                  </>
+                )}
+              </select>
+            </div>
+
+            {/* Custom NID Photo & Birth Certificate Photo Upload Panels */}
+            <div className="md:col-span-2 lg:col-span-3 grid grid-cols-1 md:grid-cols-3 gap-6">
+              {/* NID Front */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">NID Card Front Photo</label>
+                <div className="relative border-2 border-dashed border-gray-200 rounded-3xl p-4 flex flex-col items-center justify-center min-h-[140px] hover:border-blue-400 hover:bg-blue-50/20 transition-all group">
+                  {nidFrontPhoto ? (
+                    <div className="relative w-full h-full flex flex-col items-center justify-center">
+                      <img src={nidFrontPhoto} alt="NID Front" className="max-h-[100px] object-contain rounded-xl mb-2" />
+                      <button 
+                        type="button" 
+                        onClick={() => setNidFrontPhoto(null)}
+                        className="text-xs text-red-500 font-bold hover:underline"
+                      >
+                        Remove Photo
+                      </button>
+                    </div>
+                  ) : (
+                    <label className="w-full h-full flex flex-col items-center justify-center cursor-pointer text-gray-450 hover:text-blue-500 transition-colors">
+                      <Image className="w-8 h-8 mb-2 text-gray-300 group-hover:text-blue-400" />
+                      <span className="text-xs font-black uppercase tracking-wider">Upload Front Side</span>
+                      <span className="text-[10px] text-gray-400 mt-0.5">Click or drag image</span>
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="hidden" 
+                        onChange={(e) => handlePhotoUpload(e, "nidFront")} 
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+
+              {/* NID Back */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">NID Card Back Photo</label>
+                <div className="relative border-2 border-dashed border-gray-200 rounded-3xl p-4 flex flex-col items-center justify-center min-h-[140px] hover:border-blue-400 hover:bg-blue-50/20 transition-all group">
+                  {nidBackPhoto ? (
+                    <div className="relative w-full h-full flex flex-col items-center justify-center">
+                      <img src={nidBackPhoto} alt="NID Back" className="max-h-[100px] object-contain rounded-xl mb-2" />
+                      <button 
+                        type="button" 
+                        onClick={() => setNidBackPhoto(null)}
+                        className="text-xs text-red-500 font-bold hover:underline"
+                      >
+                        Remove Photo
+                      </button>
+                    </div>
+                  ) : (
+                    <label className="w-full h-full flex flex-col items-center justify-center cursor-pointer text-gray-450 hover:text-blue-500 transition-colors">
+                      <Image className="w-8 h-8 mb-2 text-gray-300 group-hover:text-blue-400" />
+                      <span className="text-xs font-black uppercase tracking-wider">Upload Back Side</span>
+                      <span className="text-[10px] text-gray-400 mt-0.5">Click or drag image</span>
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="hidden" 
+                        onChange={(e) => handlePhotoUpload(e, "nidBack")} 
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+
+              {/* Birth Certificate */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Birth Certificate Photo</label>
+                <div className="relative border-2 border-dashed border-gray-200 rounded-3xl p-4 flex flex-col items-center justify-center min-h-[140px] hover:border-blue-400 hover:bg-blue-50/20 transition-all group">
+                  {birthCertificatePhoto ? (
+                    <div className="relative w-full h-full flex flex-col items-center justify-center">
+                      <img src={birthCertificatePhoto} alt="Birth Certificate" className="max-h-[100px] object-contain rounded-xl mb-2" />
+                      <button 
+                        type="button" 
+                        onClick={() => setBirthCertificatePhoto(null)}
+                        className="text-xs text-red-500 font-bold hover:underline"
+                      >
+                        Remove Photo
+                      </button>
+                    </div>
+                  ) : (
+                    <label className="w-full h-full flex flex-col items-center justify-center cursor-pointer text-gray-450 hover:text-blue-500 transition-colors">
+                      <Image className="w-8 h-8 mb-2 text-gray-300 group-hover:text-blue-400" />
+                      <span className="text-xs font-black uppercase tracking-wider">Upload Certificate</span>
+                      <span className="text-[10px] text-gray-400 mt-0.5">Click or drag image</span>
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="hidden" 
+                        onChange={(e) => handlePhotoUpload(e, "birth")} 
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="md:col-span-2 lg:col-span-2 space-y-1.5">
+              <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Documents (Photo/ID/PDF)</label>
+              <div className="flex flex-wrap gap-3">
+                <label className="w-24 h-24 border-2 border-dashed border-gray-200 rounded-2xl flex flex-col items-center justify-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-all text-gray-400 hover:text-blue-500">
+                  <FilePlus className="w-6 h-6 mb-1" />
+                  <span className="text-[10px] font-bold uppercase">Upload</span>
+                  <input type="file" multiple className="hidden" onChange={handleFileChange} accept="image/*,.pdf" />
+                </label>
+                {employeeDocuments.map((doc, idx) => (
+                  <div key={idx} className="relative w-24 h-24 bg-gray-50 rounded-2xl border border-gray-200 flex items-center justify-center p-2 group overflow-hidden">
+                    {doc.type.startsWith('image/') ? (
+                      <img src={doc.data} alt={doc.name} className="w-full h-full object-cover rounded-lg" />
+                    ) : (
+                      <FileText className="w-8 h-8 text-blue-500" />
+                    )}
+                    <button 
+                      type="button"
+                      onClick={() => removeDocument(idx)}
+                      className="absolute top-1 right-1 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                    <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-[8px] p-1 truncate text-center">
+                      {doc.name}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="md:col-span-2 lg:col-span-3 pt-4 flex gap-4">
+              <button 
+                type="submit"
+                className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold text-lg hover:bg-blue-700 transition-all shadow-lg active:scale-95 cursor-pointer"
+              >
+                Register Employee
+              </button>
+              {onSuccess && (
+                <button 
+                  type="button"
+                  onClick={onSuccess}
+                  className="px-8 py-4 bg-gray-100 text-gray-500 rounded-2xl font-bold hover:bg-gray-200 transition-all cursor-pointer"
+                >
+                  View Employee List
+                </button>
+              )}
+            </div>
+          </form>
+        </motion.div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight mb-1">Employee Management</h2>
+          <p className="text-sm text-gray-500">Track staff details, salaries, and advances.</p>
+        </div>
+        <div className="flex items-center gap-3">
+          <button 
+            type="button"
+            onClick={handlePrintRoster}
+            className="bg-blue-50 text-blue-600 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-blue-100 border border-blue-200 transition-all shadow-sm active:scale-95"
+          >
+            <Printer className="w-5 h-5" />
+            Print Roster
+          </button>
+          <button 
+            onClick={() => setShowImport(!showImport)}
+            className="bg-white border text-gray-700 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-gray-50 border-gray-200 transition-all shadow-sm active:scale-95"
+          >
+            <History className="w-5 h-5" />
+            Bulk Import
+          </button>
+          <button 
+            onClick={() => {
+              if (showForm) resetForm();
+              else setShowForm(true);
+            }}
+            className="bg-gray-900 text-white px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-gray-800 transition-all shadow-lg active:scale-95"
+          >
+            {showForm ? <Trash2 className="w-5 h-5" /> : <UserPlus className="w-5 h-5" />}
+            {showForm ? "Cancel" : "Add Employee"}
+          </button>
+        </div>
+      </header>
+
+      {showImport && (
+        <div className="bg-white p-8 rounded-[32px] border border-gray-100 shadow-xl max-w-2xl">
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-lg font-bold">Bulk Import Employees</h3>
+              <p className="text-sm text-gray-500">Format: Name, Role, Salary (one per line)</p>
+            </div>
+            <textarea
+              placeholder="Joy Dutta, Manager, 25000&#10;Rahim Ali, Sales, 15000"
+              value={importText}
+              onChange={e => setImportText(e.target.value)}
+              className="w-full h-48 px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-mono text-sm"
+            />
+            <div className="flex gap-4">
+               <button 
+                onClick={handleBulkImport}
+                className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all"
+              >
+                Import List
+              </button>
+              <button 
+                onClick={() => setShowImport(false)}
+                className="px-8 py-4 bg-gray-100 text-gray-600 rounded-2xl font-bold hover:bg-gray-200 transition-all"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <AnimatePresence>
+        {showForm && (
+          <div className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-md flex items-center justify-center p-3 sm:p-6 overflow-y-auto animate-in fade-in duration-200">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="bg-white w-full max-w-4xl rounded-[32px] border border-gray-100 shadow-2xl overflow-hidden my-auto"
+            >
+              {/* Modal Header */}
+              <div className="p-6 bg-gradient-to-r from-gray-900 to-slate-800 text-white flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center text-blue-400 font-bold border border-white/10 shrink-0">
+                    {editingEmployee ? <Pencil className="w-6 h-6" /> : <UserPlus className="w-6 h-6" />}
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-black tracking-tight">
+                      {editingEmployee ? `Edit Profile: ${editingEmployee.name}` : "New Employee Registration"}
+                    </h3>
+                    <p className="text-xs text-gray-300 font-medium">
+                      {editingEmployee ? `Employee ID: ${editingEmployee.employeeIdCode || editingEmployee.id}` : "Fill in staff credentials and official documents"}
+                    </p>
+                  </div>
+                </div>
+                <button 
+                  type="button" 
+                  onClick={resetForm}
+                  className="p-2 text-gray-400 hover:text-white hover:bg-white/10 rounded-xl transition-all cursor-pointer"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              {/* Form Body */}
+              <form onSubmit={handleAddEmployee} className="p-6 sm:p-8 space-y-6 max-h-[78vh] overflow-y-auto">
+                {saveError && (
+                  <div className="p-4 bg-red-50 border border-red-200 rounded-2xl flex items-start gap-3 text-red-700 text-sm font-medium animate-in fade-in">
+                    <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-bold">Save Failed</p>
+                      <p>{saveError}</p>
+                    </div>
+                  </div>
+                )}
+
+                {isCompressing && (
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-2xl flex items-center gap-3 text-blue-700 text-xs font-bold animate-pulse">
+                    <Loader2 className="w-4 h-4 animate-spin text-blue-600 shrink-0" />
+                    <span>Compressing & optimizing photo uploads...</span>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1 flex items-center gap-1.5">
+                      Employee ID
+                      <span className="text-[9px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded font-mono">Auto generated</span>
+                    </label>
+                    <input 
+                      placeholder="e.g. MCS 01"
+                      value={employeeIdCode}
+                      onChange={e => setEmployeeIdCode(e.target.value)}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-bold font-mono"
+                    />
+                  </div>
+                  <div className="space-y-1.5 md:col-span-2 lg:col-span-2">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Full Name *</label>
+                    <input 
+                      required
+                      placeholder="Employee Name"
+                      value={name}
+                      onChange={e => setName(e.target.value)}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Phone Number</label>
+                    <input 
+                      type="tel"
+                      placeholder="e.g. 017XXXXXXXX"
+                      value={phone}
+                      onChange={e => setPhone(e.target.value)}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium font-mono"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Email Address</label>
+                    <input 
+                      type="email"
+                      placeholder="e.g. employee@company.com"
+                      value={email}
+                      onChange={e => setEmail(e.target.value)}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Designation / Role</label>
+                    <input 
+                      placeholder="e.g. Sales Officer, Manager"
+                      value={empRole}
+                      onChange={e => setEmpRole(e.target.value)}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between pl-1">
+                      <label className="text-xs font-bold text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
+                        <span>Monthly Salary (BDT)</span>
+                        {isSuperAdmin ? (
+                          <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 border border-emerald-300 px-2 py-0.5 rounded-full flex items-center gap-1">
+                            <Crown className="w-3 h-3 text-amber-500" /> Super Admin
+                          </span>
+                        ) : (
+                          <span className="text-[10px] font-bold text-slate-500 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-full flex items-center gap-1">
+                            <Lock className="w-3 h-3 text-slate-400" /> Super Admin Only
+                          </span>
+                        )}
+                      </label>
+                    </div>
+
+                    {isSuperAdmin ? (
+                      <div className="relative">
+                        <span className="absolute left-4 top-1/2 -translate-y-1/2 font-black font-mono text-emerald-600 text-lg">৳</span>
+                        <input 
+                          type="number"
+                          min="0"
+                          step="any"
+                          placeholder="0.00"
+                          value={salary}
+                          onChange={e => setSalary(e.target.value)}
+                          className="w-full pl-9 pr-4 py-4 bg-emerald-50/20 border-2 border-emerald-300/80 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-100 rounded-2xl font-black font-mono text-lg text-slate-900 transition-all outline-none"
+                        />
+                      </div>
+                    ) : (
+                      <div className="relative">
+                        <span className="absolute left-4 top-1/2 -translate-y-1/2 font-bold font-mono text-slate-400 text-lg">৳</span>
+                        <input 
+                          type="text"
+                          disabled
+                          readOnly
+                          value={editingEmployee ? (editingEmployee.salary ? `৳${editingEmployee.salary.toLocaleString()}` : "৳০.০০") : "Protected"}
+                          className="w-full pl-9 pr-4 py-4 bg-slate-100/90 border border-slate-200 rounded-2xl font-bold font-mono text-base text-slate-600 cursor-not-allowed select-none outline-none"
+                        />
+                      </div>
+                    )}
+                    <p className="text-[11px] text-slate-500 pl-1">
+                      {isSuperAdmin 
+                        ? "কর্মীর মাসিক মূল বেতন (সুপার এডমিন নিয়ন্ত্রণ)" 
+                        : "🔒 শুধুমাত্র সুপার এডমিন (SUPER Admin) কর্মীর বেতন পরিবর্তন করতে পারবেন।"}
+                    </p>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Employment Status</label>
+                    <select
+                      value={status}
+                      onChange={e => setStatus(e.target.value as "active" | "inactive")}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+                    >
+                      <option value="active">Active Staff</option>
+                      <option value="inactive">Resigned / Inactive</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Department</label>
+                    <select
+                      value={department}
+                      onChange={e => setDepartment(e.target.value)}
+                      className="w-full px-4 py-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-gray-200 font-medium"
+                    >
+                      {customDepts.length > 0 ? (
+                        customDepts.map(d => (
+                          <option key={d.id || d.name} value={d.name}>{d.name}</option>
+                        ))
+                      ) : (
+                        <>
+                          <option value="Sales">Sales</option>
+                          <option value="Accounts">Accounts</option>
+                          <option value="Marketing">Marketing</option>
+                          <option value="IT / Support">IT / Support</option>
+                          <option value="Management">Management</option>
+                          <option value="Delivery">Delivery</option>
+                          <option value="Others">Others</option>
+                        </>
+                      )}
+                    </select>
+                  </div>
+
+                  {/* Custom NID Photo & Birth Certificate Photo Upload Panels */}
+                  <div className="md:col-span-2 lg:col-span-3 grid grid-cols-1 md:grid-cols-3 gap-6">
+                    {/* NID Front */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">NID Card Front Photo</label>
+                      <div className="relative border-2 border-dashed border-gray-200 rounded-3xl p-4 flex flex-col items-center justify-center min-h-[140px] hover:border-blue-400 hover:bg-blue-50/20 transition-all group">
+                        {nidFrontPhoto ? (
+                          <div className="relative w-full h-full flex flex-col items-center justify-center">
+                            <img src={nidFrontPhoto} alt="NID Front" className="max-h-[100px] object-contain rounded-xl mb-2" />
+                            <button 
+                              type="button" 
+                              onClick={() => setNidFrontPhoto(null)}
+                              className="text-xs text-red-500 font-bold hover:underline cursor-pointer"
+                            >
+                              Remove Photo
+                            </button>
+                          </div>
+                        ) : (
+                          <label className="w-full h-full flex flex-col items-center justify-center cursor-pointer text-gray-450 hover:text-blue-500 transition-colors">
+                            <Image className="w-8 h-8 mb-2 text-gray-300 group-hover:text-blue-400" />
+                            <span className="text-xs font-black uppercase tracking-wider">Upload Front Side</span>
+                            <span className="text-[10px] text-gray-400 mt-0.5">Click or camera photo</span>
+                            <input 
+                              type="file" 
+                              accept="image/*" 
+                              className="hidden" 
+                              onChange={(e) => handlePhotoUpload(e, "nidFront")} 
+                            />
+                          </label>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* NID Back */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">NID Card Back Photo</label>
+                      <div className="relative border-2 border-dashed border-gray-200 rounded-3xl p-4 flex flex-col items-center justify-center min-h-[140px] hover:border-blue-400 hover:bg-blue-50/20 transition-all group">
+                        {nidBackPhoto ? (
+                          <div className="relative w-full h-full flex flex-col items-center justify-center">
+                            <img src={nidBackPhoto} alt="NID Back" className="max-h-[100px] object-contain rounded-xl mb-2" />
+                            <button 
+                              type="button" 
+                              onClick={() => setNidBackPhoto(null)}
+                              className="text-xs text-red-500 font-bold hover:underline cursor-pointer"
+                            >
+                              Remove Photo
+                            </button>
+                          </div>
+                        ) : (
+                          <label className="w-full h-full flex flex-col items-center justify-center cursor-pointer text-gray-450 hover:text-blue-500 transition-colors">
+                            <Image className="w-8 h-8 mb-2 text-gray-300 group-hover:text-blue-400" />
+                            <span className="text-xs font-black uppercase tracking-wider">Upload Back Side</span>
+                            <span className="text-[10px] text-gray-400 mt-0.5">Click or camera photo</span>
+                            <input 
+                              type="file" 
+                              accept="image/*" 
+                              className="hidden" 
+                              onChange={(e) => handlePhotoUpload(e, "nidBack")} 
+                            />
+                          </label>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Birth Certificate */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Birth Certificate Photo</label>
+                      <div className="relative border-2 border-dashed border-gray-200 rounded-3xl p-4 flex flex-col items-center justify-center min-h-[140px] hover:border-blue-400 hover:bg-blue-50/20 transition-all group">
+                        {birthCertificatePhoto ? (
+                          <div className="relative w-full h-full flex flex-col items-center justify-center">
+                            <img src={birthCertificatePhoto} alt="Birth Certificate" className="max-h-[100px] object-contain rounded-xl mb-2" />
+                            <button 
+                              type="button" 
+                              onClick={() => setBirthCertificatePhoto(null)}
+                              className="text-xs text-red-500 font-bold hover:underline cursor-pointer"
+                            >
+                              Remove Photo
+                            </button>
+                          </div>
+                        ) : (
+                          <label className="w-full h-full flex flex-col items-center justify-center cursor-pointer text-gray-450 hover:text-blue-500 transition-colors">
+                            <Image className="w-8 h-8 mb-2 text-gray-300 group-hover:text-blue-400" />
+                            <span className="text-xs font-black uppercase tracking-wider">Upload Certificate</span>
+                            <span className="text-[10px] text-gray-400 mt-0.5">Click or camera photo</span>
+                            <input 
+                              type="file" 
+                              accept="image/*" 
+                              className="hidden" 
+                              onChange={(e) => handlePhotoUpload(e, "birth")} 
+                            />
+                          </label>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="md:col-span-2 lg:col-span-2 space-y-1.5">
+                    <label className="text-xs font-bold text-gray-400 uppercase tracking-widest pl-1">Documents (Photo/ID/PDF)</label>
+                    <div className="flex flex-wrap gap-3">
+                      <label className="w-24 h-24 border-2 border-dashed border-gray-200 rounded-2xl flex flex-col items-center justify-center cursor-pointer hover:border-blue-400 hover:bg-blue-50 transition-all text-gray-400 hover:text-blue-500">
+                        <FilePlus className="w-6 h-6 mb-1" />
+                        <span className="text-[10px] font-bold uppercase">Upload</span>
+                        <input type="file" multiple className="hidden" onChange={handleFileChange} accept="image/*,.pdf" />
+                      </label>
+                      {employeeDocuments.map((doc, idx) => (
+                        <div key={idx} className="relative w-24 h-24 bg-gray-50 rounded-2xl border border-gray-100 flex items-center justify-center p-2 group overflow-hidden">
+                          {doc.type.startsWith('image/') ? (
+                            <img src={doc.data} alt={doc.name} className="w-full h-full object-cover rounded-lg" />
+                          ) : (
+                            <FileText className="w-8 h-8 text-blue-500" />
+                          )}
+                          <button 
+                            type="button"
+                            onClick={() => removeDocument(idx)}
+                            className="absolute top-1 right-1 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                          <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-[8px] p-1 truncate text-center">
+                            {doc.name}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Submit Action Bar */}
+                <div className="pt-4 flex gap-4 border-t border-gray-100">
+                  <button 
+                    type="submit"
+                    disabled={isSaving || isCompressing}
+                    className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold text-lg hover:bg-blue-700 transition-all shadow-lg active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                  >
+                    {isSaving ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span>Saving Profile...</span>
+                      </>
+                    ) : (
+                      <span>{editingEmployee ? "Update Employee Profile" : "Register Employee"}</span>
+                    )}
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={resetForm}
+                    disabled={isSaving}
+                    className="px-8 py-4 bg-gray-100 text-gray-600 rounded-2xl font-bold hover:bg-gray-200 transition-all cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {loading ? (
+          <div className="col-span-full py-20 text-center text-gray-400 font-medium">Crunching employee data...</div>
+        ) : employees.length === 0 ? (
+          <div className="col-span-full py-20 text-center bg-white rounded-3xl border border-dashed border-gray-200">
+            <Users className="w-12 h-12 text-gray-200 mx-auto mb-4" />
+            <p className="text-gray-500 font-medium">No employees added yet.</p>
+          </div>
+        ) : (
+          employees.map(emp => {
+            const stats = getEmployeeStats(emp.id!);
+            return (
+              <div key={emp.id} className="bg-white rounded-[32px] border border-gray-100 shadow-sm hover:shadow-md transition-all group p-6 flex flex-col">
+                <div className="flex items-start justify-between mb-6">
+                  <div className="flex items-center gap-4">
+                    <button 
+                      onClick={() => setViewingProfile(emp)}
+                      className="w-14 h-14 bg-blue-50 rounded-2xl flex items-center justify-center border border-blue-100 text-blue-600 hover:bg-blue-600 hover:text-white transition-all overflow-hidden"
+                    >
+                      {emp.documents?.find(d => d.type.startsWith('image/')) ? (
+                        <img src={emp.documents.find(d => d.type.startsWith('image/'))?.data} alt="" className="w-full h-full object-cover" />
+                      ) : (
+                        <UserCircle className="w-8 h-8" />
+                      )}
+                    </button>
+                    <div>
+                      <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
+                        {emp.employeeIdCode && (
+                          <span className="text-[10px] bg-slate-100 font-extrabold font-mono text-slate-800 px-1.5 py-0.5 rounded leading-none shrink-0 border border-slate-200/50">
+                            {emp.employeeIdCode}
+                          </span>
+                        )}
+                        <h3 className="font-bold text-gray-900 group-hover:text-blue-600 transition-colors flex items-center gap-2">
+                          {emp.name}
+                          <button onClick={() => setViewingProfile(emp)} className="p-1 hover:text-blue-600 text-gray-300">
+                            <ExternalLink className="w-3 h-3" />
+                          </button>
+                        </h3>
+                      </div>
+                      <p className="text-xs font-bold text-gray-400 uppercase tracking-widest">
+                        {emp.department || "Sales"} {emp.phone ? `• ${emp.phone}` : ""}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex gap-1">
+                    <button 
+                      onClick={() => startEdit(emp)}
+                      className="p-[8px] text-gray-300 hover:text-blue-500 hover:bg-blue-51 rounded-xl transition-all"
+                    >
+                      <Pencil className="w-4 h-4" />
+                    </button>
+                    {role === "admin" && (
+                      <button 
+                        onClick={() => setEmployeeToDelete(emp.id!)}
+                        className="p-[8px] text-gray-300 hover:text-red-500 hover:bg-red-51 rounded-xl transition-all"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-4 mb-6">
+                  <div className="flex justify-between items-center px-4 py-3 bg-gray-50 rounded-2xl">
+                    <div className="flex items-center gap-2">
+                      <Wallet className="w-4 h-4 text-gray-400" />
+                      <span className="text-xs font-bold text-gray-500 uppercase tracking-tight">Main Salary</span>
+                      {isSuperAdmin && (
+                        <span className="text-[9px] font-black text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                          <Crown className="w-2.5 h-2.5 text-amber-500" /> Super Admin
+                        </span>
+                      )}
+                    </div>
+                    <span className="font-black text-gray-900">{isSuperAdmin ? formatCurrency(emp.salary) : "***"}</span>
+                  </div>
+                  
+                  {/* Single Unified Section: Paid salary is an advance amount (No separate section needed) */}
+                  <div className="p-4 rounded-2xl bg-gradient-to-br from-emerald-50/70 to-teal-50/40 border border-emerald-100/90 flex flex-col justify-between gap-3 shadow-2xs">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-[11px] font-black text-emerald-800 uppercase tracking-wider flex items-center gap-1.5">
+                          <CreditCard className="w-3.5 h-3.5 text-emerald-600" /> 
+                          <span>প্রদত্ত বেতন ও অগ্রিম (Disbursed Salary / Advance)</span>
+                        </p>
+                        <p className="text-[10px] text-slate-500 font-bold mt-0.5">
+                          Paid salary is an advance amount
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <span className="font-mono font-black text-base sm:text-lg text-emerald-700 block">
+                          {isSuperAdmin ? formatCurrency(stats.totalPaid + stats.totalAdvance) : "***"}
+                        </span>
+                        {emp.salary > 0 && isSuperAdmin && (
+                          <span className="text-[10px] font-bold text-slate-500 block">
+                            বকেয়া: {formatCurrency(Math.max(0, emp.salary - (stats.totalPaid + stats.totalAdvance)))}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    
+                    <button 
+                      type="button"
+                      onClick={() => { 
+                        setQuickPay({ empId: emp.id!, type: "Staff Salary" }); 
+                        const rem = Math.max(0, (emp.salary || 0) - (stats.totalPaid + stats.totalAdvance));
+                        setPayAmount(rem > 0 ? rem.toString() : ""); 
+                      }}
+                      className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 shadow-sm shadow-emerald-600/20 active:scale-98 transition-all cursor-pointer"
+                    >
+                      <Coins className="w-4 h-4" /> বেতন ও অগ্রিম প্রদান করুন (Disburse Salary / Advance)
+                    </button>
+                  </div>
+                  <button 
+                    onClick={() => setViewingAttendance(emp)}
+                    className="w-full mt-2 py-3 bg-indigo-50 text-indigo-600 rounded-xl font-bold text-[10px] uppercase tracking-wider hover:bg-indigo-600 hover:text-white transition-all flex items-center justify-center gap-2"
+                  >
+                    <ShieldCheck className="w-3 h-3" /> View Attendance History
+                  </button>
+                </div>
+
+                <div className="mt-auto pt-4 border-t border-gray-50 flex items-center justify-between">
+                  <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                    Joined {format(new Date(emp.joinedDate), "MMM yyyy")}
+                  </span>
+                  <span className={cn(
+                    "px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider",
+                    emp.status === "active" ? "bg-green-50 text-green-700" : "bg-gray-100 text-gray-500"
+                  )}>
+                    {emp.status}
+                  </span>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <AnimatePresence>
+        {viewingAttendance && (
+          <AttendanceHistoryModal 
+            employee={viewingAttendance} 
+            onClose={() => setViewingAttendance(null)} 
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {viewingProfile && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-[60] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="bg-gray-50 w-full max-w-4xl rounded-[40px] overflow-hidden shadow-2xl flex flex-col max-h-[90vh]"
+            >
+              {/* Header */}
+              <div className="bg-white p-8 border-b border-gray-100 flex items-center justify-between">
+                <div className="flex items-center gap-6">
+                  <div className="w-24 h-24 bg-blue-600 rounded-[24px] flex items-center justify-center text-white overflow-hidden shadow-xl ring-4 ring-blue-50">
+                    {viewingProfile.documents?.find(d => d.type.startsWith('image/')) ? (
+                      <img src={viewingProfile.documents.find(d => d.type.startsWith('image/'))?.data} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      <UserCircle className="w-12 h-12" />
+                    )}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-3 mb-1">
+                      <h2 className="text-3xl font-black text-gray-900">{viewingProfile.name}</h2>
+                      <span className={cn(
+                        "px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider",
+                        viewingProfile.status === "active" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                      )}>
+                        {viewingProfile.status}
+                      </span>
+                    </div>
+                    <div className="text-sm text-gray-500 font-bold space-y-1 mt-1">
+                      <p>
+                        {viewingProfile.department || "Sales"} • Joined {format(new Date(viewingProfile.joinedDate), "MMMM dd, yyyy")}
+                      </p>
+                      <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-blue-600 font-bold">
+                        {viewingProfile.phone && <span>📞 {viewingProfile.phone}</span>}
+                        {viewingProfile.email && <span>✉️ {viewingProfile.email}</span>}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button 
+                    type="button"
+                    onClick={() => handlePrintProfile(viewingProfile)}
+                    title="Print Profile / Save as PDF"
+                    className="p-4 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-2xl transition-all cursor-pointer"
+                  >
+                    <Printer className="w-5 h-5" />
+                  </button>
+                  <button 
+                    onClick={() => setViewingProfile(null)}
+                    className="p-4 bg-gray-100 hover:bg-gray-200 rounded-2xl transition-all cursor-pointer"
+                  >
+                    <X className="w-6 h-6 text-gray-500" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Profile Nav Tab Bar */}
+              <div className="bg-white px-8 py-1 border-b border-gray-150 flex gap-1 flex-wrap shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setProfileTab("kyc")}
+                  className={cn(
+                    "px-4 py-3 font-bold text-xs uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-2",
+                    profileTab === "kyc"
+                      ? "border-blue-600 text-blue-600"
+                      : "border-transparent text-gray-400 hover:text-gray-600"
+                  )}
+                >
+                  <ShieldCheck className="w-4 h-4" /> Personnel KYC & Files
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProfileTab("attendance")}
+                  className={cn(
+                    "px-4 py-3 font-bold text-xs uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-2",
+                    profileTab === "attendance"
+                      ? "border-blue-600 text-blue-600"
+                      : "border-transparent text-gray-400 hover:text-gray-600"
+                  )}
+                >
+                  <History className="w-4 h-4" /> Attendance & Clock-In Log ({profileAttendance.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProfileTab("financial")}
+                  className={cn(
+                    "px-4 py-3 font-bold text-xs uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-2",
+                    profileTab === "financial"
+                      ? "border-blue-600 text-blue-600"
+                      : "border-transparent text-gray-400 hover:text-gray-600"
+                  )}
+                >
+                  <CreditCard className="w-4 h-4" /> Financials & Payout Ledger
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto p-8 bg-gray-50/50">
+                <AnimatePresence mode="wait">
+                  {profileTab === "kyc" && (
+                    <motion.div
+                      key="kyc"
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -10 }}
+                      className="space-y-8"
+                    >
+                {/* Stats Grid - Unified Paid Salary & Advance */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm">
+                    <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center gap-2">
+                      <Wallet className="w-4 h-4 text-blue-500" /> Basic Salary
+                    </p>
+                    <p className="text-2xl font-black text-gray-900">{isSuperAdmin ? formatCurrency(viewingProfile.salary) : "***"}</p>
+                    <p className="text-[10px] text-gray-400 font-bold mt-1">Monthly Contract</p>
+                  </div>
+                  <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm">
+                    <p className="text-xs font-bold text-emerald-800 uppercase tracking-widest mb-2 flex items-center gap-2">
+                      <CreditCard className="w-4 h-4 text-emerald-600" /> Total Paid / Advance
+                    </p>
+                    <p className="text-2xl font-black text-emerald-600">{isSuperAdmin ? formatCurrency(getEmployeeStats(viewingProfile.id!).totalPaid + getEmployeeStats(viewingProfile.id!).totalAdvance) : "***"}</p>
+                    <p className="text-[10px] text-slate-400 font-bold mt-1">Paid salary is an advance amount</p>
+                  </div>
+                  <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm">
+                    <p className="text-xs font-bold text-amber-700 uppercase tracking-widest mb-2 flex items-center gap-2">
+                      <History className="w-4 h-4 text-amber-500" /> Remaining Balance
+                    </p>
+                    <p className="text-2xl font-black text-amber-600">
+                      {isSuperAdmin ? formatCurrency(Math.max(0, viewingProfile.salary - (getEmployeeStats(viewingProfile.id!).totalPaid + getEmployeeStats(viewingProfile.id!).totalAdvance))) : "***"}
+                    </p>
+                    <p className="text-[10px] text-slate-400 font-bold mt-1">Current Due Balance</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  {/* Documents Section */}
+                  <div className="space-y-4">
+                    <h3 className="font-bold text-gray-900 flex items-center gap-2">
+                      <FilePlus className="w-5 h-5 text-gray-400" /> 
+                      Employee Documents ({viewingProfile.documents?.length || 0})
+                    </h3>
+                    <div className="grid grid-cols-2 gap-4">
+                      {viewingProfile.documents?.map((doc, idx) => (
+                        <div key={idx} className="bg-white p-4 rounded-2xl border border-gray-100 flex items-center gap-4 group hover:border-blue-200 transition-all">
+                          <div className="w-12 h-12 bg-gray-50 rounded-xl flex items-center justify-center shrink-0">
+                            {doc.type.startsWith('image/') ? <Image className="w-6 h-6 text-blue-500" /> : <FileText className="w-6 h-6 text-orange-500" />}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="text-sm font-bold text-gray-900 truncate">{doc.name}</p>
+                            <a 
+                              href={doc.data} 
+                              download={doc.name}
+                              className="text-[10px] font-bold text-blue-600 uppercase hover:underline flex items-center gap-1"
+                            >
+                              <Download className="w-3 h-3" /> Download
+                            </a>
+                          </div>
+                        </div>
+                      ))}
+                      {!viewingProfile.documents?.length && (
+                        <div className="col-span-2 py-8 text-center bg-gray-100/50 rounded-2xl border-2 border-dashed border-gray-200 text-gray-400 font-medium italic">
+                          No documents uploaded.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Recent Transactions */}
+                  <div className="space-y-4">
+                    <h3 className="font-bold text-gray-900 flex items-center gap-2">
+                      <History className="w-5 h-5 text-gray-400" /> Recent Transactions
+                    </h3>
+                    <div className="space-y-2">
+                      {transactions
+                        .filter(tx => tx.employeeId === viewingProfile.id)
+                        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+                        .slice(0, 5)
+                        .map(tx => (
+                          <div key={tx.id} className="bg-white p-4 rounded-2xl flex items-center justify-between border border-gray-50">
+                            <div>
+                              <p className="text-xs font-bold text-gray-900">{tx.category} - {tx.subCategory}</p>
+                              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{format(new Date(tx.date), "MMM dd, yyyy")}</p>
+                            </div>
+                            <p className="font-black text-gray-900">-{role === "admin" ? formatCurrency(tx.amount) : "***"}</p>
+                          </div>
+                        ))}
+                      {!transactions.filter(tx => tx.employeeId === viewingProfile.id).length && (
+                        <div className="py-8 text-center bg-gray-100/50 rounded-2xl border-2 border-dashed border-gray-200 text-gray-400 font-medium italic">
+                          No transaction history.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Identification Documents (KYC) Section - takes full width */}
+                  <div className="space-y-4 lg:col-span-2 pt-4">
+                    <h3 className="font-bold text-gray-900 flex items-center gap-2">
+                      <ShieldCheck className="w-5 h-5 text-blue-600" /> 
+                      Official Information & KYC Documents
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                      {/* NID Front */}
+                      <div className="bg-white p-5 rounded-[24px] border border-gray-100 shadow-sm flex flex-col items-center justify-center text-center">
+                        <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">NID Card Front</p>
+                        {viewingProfile.nidFrontPhoto ? (
+                          <div className="w-full flex flex-col items-center">
+                            <div className="w-full h-32 bg-gray-50 rounded-2xl overflow-hidden flex items-center justify-center border border-gray-100 mb-3 shadow-inner">
+                              <img src={viewingProfile.nidFrontPhoto} alt="NID Front" className="w-full h-full object-contain p-2" />
+                            </div>
+                            <a href={viewingProfile.nidFrontPhoto} download={`${viewingProfile.name}_NID_Front.png`} className="text-[10px] text-blue-600 font-bold uppercase tracking-wider flex items-center gap-1.5 hover:underline">
+                              <Download className="w-3.5 h-3.5" /> Download
+                            </a>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-400 italic py-8">No Front NID Photo uploaded</p>
+                        )}
+                      </div>
+
+                      {/* NID Back */}
+                      <div className="bg-white p-5 rounded-[24px] border border-gray-100 shadow-sm flex flex-col items-center justify-center text-center">
+                        <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">NID Card Back</p>
+                        {viewingProfile.nidBackPhoto ? (
+                          <div className="w-full flex flex-col items-center">
+                            <div className="w-full h-32 bg-gray-50 rounded-2xl overflow-hidden flex items-center justify-center border border-gray-100 mb-3 shadow-inner">
+                              <img src={viewingProfile.nidBackPhoto} alt="NID Back" className="w-full h-full object-contain p-2" />
+                            </div>
+                            <a href={viewingProfile.nidBackPhoto} download={`${viewingProfile.name}_NID_Back.png`} className="text-[10px] text-blue-600 font-bold uppercase tracking-wider flex items-center gap-1.5 hover:underline">
+                              <Download className="w-3.5 h-3.5" /> Download
+                            </a>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-400 italic py-8">No Back NID Photo uploaded</p>
+                        )}
+                      </div>
+
+                      {/* Birth Certificate */}
+                      <div className="bg-white p-5 rounded-[24px] border border-gray-100 shadow-sm flex flex-col items-center justify-center text-center">
+                        <p className="text-xs font-black text-gray-400 uppercase tracking-widest mb-3">Birth Certificate</p>
+                        {viewingProfile.birthCertificatePhoto ? (
+                          <div className="w-full flex flex-col items-center">
+                            <div className="w-full h-32 bg-gray-50 rounded-2xl overflow-hidden flex items-center justify-center border border-gray-100 mb-3 shadow-inner">
+                              <img src={viewingProfile.birthCertificatePhoto} alt="Birth Certificate" className="w-full h-full object-contain p-2" />
+                            </div>
+                            <a href={viewingProfile.birthCertificatePhoto} download={`${viewingProfile.name}_Birth_Certificate.png`} className="text-[10px] text-blue-600 font-bold uppercase tracking-wider flex items-center gap-1.5 hover:underline">
+                              <Download className="w-3.5 h-3.5" /> Download
+                            </a>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-400 italic py-8">No Birth Certificate uploaded</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+              {profileTab === "attendance" && (
+                <motion.div
+                  key="attendance"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="space-y-8"
+                >
+                  {loadingProfileAttendance ? (
+                    <div className="py-20 text-center text-gray-400 font-bold italic animate-pulse">
+                      🔄 Querying complete ledger archives... please wait...
+                    </div>
+                  ) : (
+                    <>
+                      {/* Attendance KPIs */}
+                      {(() => {
+                        const attStats = {
+                          total: profileAttendance.length,
+                          present: profileAttendance.filter(r => r.status === "present" || r.status === "late" || r.status === "half-day").length,
+                          late: profileAttendance.filter(r => r.status === "late").length,
+                          absent: profileAttendance.filter(r => r.status === "absent").length,
+                          leave: profileAttendance.filter(r => r.status === "leave").length,
+                          halfDay: profileAttendance.filter(r => r.status === "half-day").length,
+                          holiday: profileAttendance.filter(r => r.status === "holiday").length,
+                          lunchBreaches: profileAttendance.filter(r => {
+                            const m = getLunchDurationMinutes(r.lunchOut, r.lunchIn);
+                            return m > lunchDurationLimit;
+                          }).length,
+                        };
+
+                        const percentageOnTime = attStats.present > 0 
+                          ? Math.round(((attStats.present - attStats.late) / attStats.present) * 100) 
+                          : 100;
+
+                        const presentRecords = profileAttendance.filter(r => r.checkIn && (r.status === "present" || r.status === "late" || r.status === "half-day"));
+                        let avgCheckIn = "09:00 AM";
+                        if (presentRecords.length > 0) {
+                          try {
+                            let totalMins = 0;
+                            let validCount = 0;
+                            presentRecords.forEach(r => {
+                              if (!r.checkIn) return;
+                              const cleanCheck = r.checkIn.trim().toUpperCase();
+                              const parts = cleanCheck.split(" ");
+                              const [hStr, mStr] = parts[0].split(":");
+                              let h = Number(hStr);
+                              const m = Number(mStr);
+                              if (!isNaN(h) && !isNaN(m)) {
+                                if (parts[1] === "PM" && h !== 12) h += 12;
+                                if (parts[1] === "AM" && h === 12) h = 0;
+                                totalMins += h * 60 + m;
+                                validCount++;
+                              }
+                            });
+                            if (validCount > 0) {
+                              const avgMins = Math.round(totalMins / validCount);
+                              const avgHour = Math.floor(avgMins / 60);
+                              const avgMin = avgMins % 60;
+                              const ampm = avgHour >= 12 ? "PM" : "AM";
+                              const hour12 = avgHour % 12 === 0 ? 12 : avgHour % 12;
+                              avgCheckIn = `${hour12.toString().padStart(2, "0")}:${avgMin.toString().padStart(2, "0")} ${ampm}`;
+                            }
+                          } catch (e) {
+                            console.error(e);
+                          }
+                        }
+
+                        const lunchRecords = profileAttendance.filter(r => r.lunchOut && r.lunchIn);
+                        const avgLunchDuration = lunchRecords.length > 0
+                          ? Math.round(lunchRecords.reduce((sum, r) => sum + getLunchDurationMinutes(r.lunchOut, r.lunchIn), 0) / lunchRecords.length)
+                          : 0;
+
+                        const lastRecord = profileAttendance[0];
+
+                        return (
+                          <>
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                              <div className="bg-white p-5 rounded-3xl border border-gray-150/70 shadow-2xs">
+                                <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1.5 font-sans">Shift Presence Rate</p>
+                                <p className="text-2xl font-black text-blue-600">{attStats.present} Logged Days</p>
+                                <p className="text-[10px] text-gray-400 font-bold mt-1">Absents Logged: {attStats.absent} | Leaves: {attStats.leave}</p>
+                              </div>
+                              <div className="bg-white p-5 rounded-3xl border border-gray-150/70 shadow-2xs">
+                                <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1.5 font-sans">On-Time Arrival Rate</p>
+                                <p className="text-2xl font-black text-emerald-600">{percentageOnTime > 100 ? 100 : percentageOnTime}% On-Time</p>
+                                <p className="text-[10px] text-gray-400 font-bold mt-1">Total Lates: <span className="text-red-500 font-black">{attStats.late} times</span></p>
+                              </div>
+                              <div className="bg-white p-5 rounded-3xl border border-gray-150/70 shadow-2xs">
+                                <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1.5 font-sans">Average Clock-In Hour</p>
+                                <p className="text-2xl font-black text-slate-800 font-mono">{avgCheckIn}</p>
+                                <p className="text-[10px] text-gray-400 font-bold mt-1">Daily Official Schedule: 09:00 AM</p>
+                              </div>
+                              <div className="bg-white p-5 rounded-3xl border border-gray-150/70 shadow-2xs">
+                                <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1.5 font-bold font-sans">Lunch Break Compliance</p>
+                                <p className="text-2xl font-black text-amber-600">{avgLunchDuration}m Avg</p>
+                                <p className="text-[10px] text-gray-400 font-bold mt-1">Breach Violations: <span className="text-red-500 font-black">{attStats.lunchBreaches} incidents</span></p>
+                              </div>
+                            </div>
+
+                            {lastRecord && (
+                              <div className="bg-slate-900 text-white p-6 rounded-3xl border border-slate-800 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-md">
+                                <div>
+                                  <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Most Recent Event Record</p>
+                                  <h4 className="text-lg font-black">{format(new Date(lastRecord.date), "EEEE, dd MMMM yyyy")}</h4>
+                                  <p className="text-xs text-slate-400 uppercase font-bold tracking-wider mt-1">
+                                    Shift Status: <span className="text-amber-400 font-black">{lastRecord.status.toUpperCase()}</span>
+                                  </p>
+                                </div>
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-y-2 gap-x-6 text-xs bg-slate-800 border border-slate-700/60 p-4 rounded-2xl w-full md:w-auto">
+                                  <div>
+                                    <p className="text-slate-400 font-bold mb-0.5">Clock In</p>
+                                    <p className="font-extrabold font-mono text-white">{lastRecord.checkIn || "--:--"}</p>
+                                  </div>
+                                  <div>
+                                    <p className="text-slate-400 font-bold mb-0.5">Lunch Out</p>
+                                    <p className="font-extrabold font-mono text-white">{lastRecord.lunchOut || "--:--"}</p>
+                                  </div>
+                                  <div>
+                                    <p className="text-slate-400 font-bold mb-0.5">Lunch In</p>
+                                    <p className="font-extrabold font-mono text-white">{lastRecord.lunchIn || "--:--"}</p>
+                                  </div>
+                                  <div>
+                                    <p className="text-slate-400 font-bold mb-0.5">Clock Out</p>
+                                    <p className="font-extrabold font-mono text-white">{lastRecord.checkOut || "--:--"}</p>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="space-y-4">
+                              <div className="flex justify-between items-center bg-transparent">
+                                <h3 className="font-extrabold text-slate-900 border-l-4 border-blue-600 pl-3 uppercase text-xs tracking-wider">
+                                  Chronological Shift Logs Report (All Days Active)
+                                </h3>
+                                <span className="text-[10px] font-black text-gray-500 uppercase tracking-widest bg-gray-250 px-3 py-1 rounded-full">
+                                  Total logs archived: {profileAttendance.length}
+                                </span>
+                              </div>
+
+                              {profileAttendance.length === 0 ? (
+                                <div className="py-12 bg-white text-center text-gray-400 font-medium italic rounded-3xl border border-dashed border-gray-200">
+                                  No historical logs recorded for this personnel in the database yet.
+                                </div>
+                              ) : (
+                                <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2">
+                                  {profileAttendance.map((rec) => {
+                                    const lunchMins = getLunchDurationMinutes(rec.lunchOut, rec.lunchIn);
+                                    const lunchOvertime = lunchMins > lunchDurationLimit;
+                                    return (
+                                      <div key={rec.id} className="bg-white p-5 rounded-2xl flex flex-col md:flex-row md:items-center justify-between border border-gray-100 gap-4 shadow-2xs hover:border-blue-100 transition-all">
+                                        <div className="flex items-center gap-4">
+                                          <div className="w-12 h-12 rounded-[16px] bg-slate-50 flex flex-col items-center justify-center font-bold text-gray-600 border border-gray-150 shadow-2xs">
+                                            <p className="text-xs font-black font-mono leading-none">{format(new Date(rec.date), "dd")}</p>
+                                            <p className="text-[8px] font-black uppercase tracking-wider text-gray-400 mt-1">{format(new Date(rec.date), "MMM")}</p>
+                                          </div>
+                                          <div>
+                                            <p className="font-extrabold text-slate-900 text-sm">{format(new Date(rec.date), "EEEE, d MMMM yyyy")}</p>
+                                            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mt-1 text-[11px] text-slate-500 font-bold">
+                                              <span>In: <strong className="font-mono text-slate-800">{rec.checkIn || "09:00 AM"}</strong></span>
+                                              <span>•</span>
+                                              <span>Out: <strong className="font-mono text-slate-800">{rec.checkOut || "Active Shift"}</strong></span>
+                                              {rec.lunchOut && (
+                                                <>
+                                                  <span>•</span>
+                                                  <span className={cn(
+                                                    "flex items-center gap-1 px-1.5 py-0.5 rounded-sm line-clamp-1",
+                                                    lunchOvertime ? "bg-red-50 text-red-600 font-black" : "bg-green-50 text-green-700"
+                                                  )}>
+                                                    Lunch: {rec.lunchOut} - {rec.lunchIn || "Ongoing"} ({lunchMins}m)
+                                                    {lunchOvertime && ` *+${lunchMins - lunchDurationLimit}m Overtime`}
+                                                  </span>
+                                                </>
+                                              )}
+                                            </div>
+                                          </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-3 justify-end shrink-0">
+                                          {rec.notes && (
+                                            <span className="text-[10px] text-gray-500 bg-gray-55 border border-gray-100 max-w-[200px] truncate px-2.5 py-1 rounded-lg italic font-bold" title={rec.notes}>
+                                              📝 {rec.notes}
+                                            </span>
+                                          )}
+                                          <span className={cn(
+                                            "px-3.5 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border shrink-0 text-center",
+                                            rec.status === "present" && "bg-blue-50 text-blue-700 border-blue-100",
+                                            rec.status === "late" && "bg-orange-50 text-orange-700 border-orange-100",
+                                            rec.status === "absent" && "bg-red-50 text-red-700 border-red-100",
+                                            rec.status === "leave" && "bg-indigo-50 text-indigo-700 border-indigo-100",
+                                            rec.status === "half-day" && "bg-yellow-50 text-yellow-700 border-yellow-10 border-yellow-110",
+                                            rec.status === "holiday" && "bg-emerald-50 text-emerald-700 border-emerald-100",
+                                          )}>
+                                            {rec.status}
+                                          </span>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </>
+                  )}
+                </motion.div>
+              )}
+
+              {profileTab === "financial" && (
+                <motion.div
+                  key="financial"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="space-y-8"
+                >
+                  {/* Stats Grid - Unified Paid Salary & Advance */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm">
+                      <p className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center gap-2">
+                        <Wallet className="w-4 h-4 text-blue-500" /> Basic Salary Contract
+                      </p>
+                      <p className="text-2xl font-black text-gray-900">{isSuperAdmin ? formatCurrency(viewingProfile.salary) : "***"}</p>
+                      <p className="text-[10px] text-gray-400 font-bold mt-1">Official Base Rate</p>
+                    </div>
+                    <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm">
+                      <p className="text-xs font-bold text-emerald-800 uppercase tracking-widest mb-2 flex items-center gap-2">
+                        <CreditCard className="w-4 h-4 text-emerald-600" /> Total Paid / Advance to Date
+                      </p>
+                      <p className="text-2xl font-black text-emerald-600">{isSuperAdmin ? formatCurrency(getEmployeeStats(viewingProfile.id!).totalPaid + getEmployeeStats(viewingProfile.id!).totalAdvance) : "***"}</p>
+                      <p className="text-[10px] text-slate-400 font-bold mt-1">Paid salary is an advance amount</p>
+                    </div>
+                    <div className="bg-white p-6 rounded-3xl border border-gray-150 shadow-sm">
+                      <p className="text-xs font-bold text-amber-700 uppercase tracking-widest mb-2 flex items-center gap-2">
+                        <History className="w-4 h-4 text-amber-500" /> Current Outstanding Due
+                      </p>
+                      <p className="text-2xl font-black text-amber-600">
+                        {isSuperAdmin ? formatCurrency(Math.max(0, viewingProfile.salary - (getEmployeeStats(viewingProfile.id!).totalPaid + getEmployeeStats(viewingProfile.id!).totalAdvance))) : "***"}
+                      </p>
+                      <p className="text-[10px] text-slate-400 font-bold mt-1">Remaining Monthly Due</p>
+                    </div>
+                  </div>
+
+                  {/* Transaction history */}
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center bg-transparent">
+                      <h3 className="font-bold text-gray-900 flex items-center gap-2">
+                        <History className="w-5 h-5 text-gray-400" /> Complete Financial Transaction History
+                      </h3>
+                      <span className="text-[10px] text-gray-400 font-extrabold uppercase bg-gray-100 px-3 py-1 rounded-full">
+                        Total operations: {transactions.filter(tx => tx.employeeId === viewingProfile.id).length}
+                      </span>
+                    </div>
+                    <div className="space-y-2 max-h-[350px] overflow-y-auto pr-2">
+                      {transactions
+                        .filter(tx => tx.employeeId === viewingProfile.id)
+                        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+                        .map(tx => (
+                          <div key={tx.id} className="bg-white p-5 rounded-2xl flex items-center justify-between border border-gray-50 shadow-2xs hover:border-gray-200 transition-all">
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className={cn(
+                                  "px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-wider",
+                                  tx.category === "Staff Salary" ? "bg-green-100 text-green-700" : "bg-orange-100 text-orange-700"
+                                )}>
+                                  {tx.category}
+                                </span>
+                                <span className="text-xs font-black text-slate-800">{tx.subCategory || "Payout Details"}</span>
+                              </div>
+                              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{format(new Date(tx.date), "EEEE, MMMM dd, yyyy")}</p>
+                              {tx.notes && <p className="text-[11px] text-gray-500 italic font-medium">Memo: "{tx.notes}"</p>}
+                            </div>
+                            <div className="text-right">
+                              <p className="font-black text-base text-gray-900">-{role === "admin" ? formatCurrency(tx.amount) : "***"}</p>
+                              <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest">{tx.paymentMethod || "Cash"} • Verified</span>
+                            </div>
+                          </div>
+                        ))}
+                      {!transactions.filter(tx => tx.employeeId === viewingProfile.id).length && (
+                        <div className="py-12 text-center bg-white rounded-2xl border-2 border-dashed border-gray-200 text-gray-400 font-medium italic">
+                          No historical transactions or salary pays logged for this personnel.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+              {/* Actions Footer */}
+              <div className="p-8 bg-white border-t border-gray-100 flex justify-end gap-4 flex-wrap">
+                <button 
+                  type="button"
+                  onClick={() => handlePrintProfile(viewingProfile)}
+                  className="px-6 py-3 bg-blue-600 text-white hover:bg-blue-700 rounded-2xl font-bold transition-all flex items-center gap-2 cursor-pointer shadow-md"
+                >
+                  <Printer className="w-4 h-4" /> Print / Save PDF
+                </button>
+                <button 
+                  onClick={() => { startEdit(viewingProfile); setViewingProfile(null); }}
+                  className="px-6 py-3 bg-blue-50 text-blue-600 hover:bg-blue-600 hover:text-white rounded-2xl font-bold transition-all flex items-center gap-2 cursor-pointer"
+                >
+                  <Pencil className="w-4 h-4" /> Edit Profile
+                </button>
+                <button 
+                  onClick={() => setViewingProfile(null)}
+                  className="px-6 py-3 bg-gray-900 text-white rounded-2xl font-bold hover:bg-gray-800 transition-all cursor-pointer"
+                >
+                  Close Profile
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {quickPay && (() => {
+        const targetEmp = employees.find(e => e.id === quickPay.empId);
+        const targetStats = targetEmp ? getEmployeeStats(targetEmp.id!) : { totalPaid: 0, totalAdvance: 0 };
+        const totalDisbursed = targetStats.totalPaid + targetStats.totalAdvance;
+        const currentDue = targetEmp ? Math.max(0, (targetEmp.salary || 0) - totalDisbursed) : 0;
+        const parsedPayAmount = parseFloat(payAmount) || 0;
+        const remainingAfterPay = Math.max(0, currentDue - parsedPayAmount);
+
+        return (
+          <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-md z-[80] flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200">
+            <div className="bg-white w-full max-w-lg rounded-[36px] overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[92vh]">
+              {/* Modal Header */}
+              <div className="p-6 bg-gradient-to-r from-emerald-700 via-teal-700 to-slate-900 text-white flex justify-between items-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-white/10 backdrop-blur-md border border-white/20 flex items-center justify-center text-emerald-300 shrink-0">
+                    <Coins className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-black tracking-tight">বেতন ও অগ্রিম প্রদান (Salary & Advance)</h3>
+                    <p className="text-xs text-emerald-100/90 font-medium">
+                      প্রাপক: <strong className="text-white underline">{targetEmp?.name}</strong> {targetEmp?.employeeIdCode ? `(${targetEmp.employeeIdCode})` : ""}
+                    </p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setQuickPay(null)} 
+                  className="p-2 text-white/70 hover:text-white hover:bg-white/10 rounded-xl transition-all cursor-pointer"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              {/* Explanatory Banner: Paid salary is an advance amount */}
+              <div className="bg-emerald-50 px-6 py-3 border-b border-emerald-100 flex items-center gap-2 text-emerald-900 text-xs font-semibold shrink-0">
+                <Coins className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>Paid salary is an advance amount — বেতন প্রদানই মূলত অগ্রিম অর্থ। কোনো আলাদা সেকশন ছাড়াই একক এন্ট্রিতে বেতন ও অগ্রিম সমন্বিত হয়।</span>
+              </div>
+              
+              <form onSubmit={handleQuickPay} className="p-6 sm:p-8 space-y-6 overflow-y-auto">
+                {/* Employee Financial Context Strip */}
+                <div className="grid grid-cols-3 gap-2 p-3 bg-slate-50 rounded-2xl border border-slate-200/70 text-center">
+                  <div>
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">মাসিক মূল বেতন</span>
+                    <span className="font-mono font-black text-sm text-slate-900">
+                      {isSuperAdmin && targetEmp ? formatCurrency(targetEmp.salary || 0) : "***"}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">ইতোমধ্যে প্রদেয়</span>
+                    <span className="font-mono font-black text-sm text-emerald-700">
+                      {isSuperAdmin ? formatCurrency(totalDisbursed) : "***"}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">অবশিষ্ট বকেয়া</span>
+                    <span className="font-mono font-black text-sm text-amber-700">
+                      {isSuperAdmin ? formatCurrency(currentDue) : "***"}
+                    </span>
+                  </div>
+                </div>
+
+                {/* THE BIG SALARY INPUT BOX (Lynn is big for full understanding) */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between pl-1">
+                    <label className="text-xs font-black text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                      <span>প্রদেয় বেতন / অগ্রিম পরিমাণ (BDT Amount)</span>
+                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
+                        বড় ইনপুট বক্স
+                      </span>
+                    </label>
+                  </div>
+                  <div className="relative">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-2xl sm:text-3xl font-black text-emerald-600 font-mono select-none">
+                      ৳
+                    </span>
+                    <input
+                      type="number"
+                      step="any"
+                      min="0"
+                      required
+                      autoFocus
+                      placeholder="০.০০"
+                      value={payAmount}
+                      onChange={(e) => setPayAmount(e.target.value)}
+                      className="w-full pl-12 pr-4 py-4 sm:py-5 bg-white border-2 border-emerald-400 focus:border-emerald-600 focus:ring-4 focus:ring-emerald-100 rounded-3xl text-2xl sm:text-3xl font-mono font-black text-slate-950 shadow-sm outline-none transition-all placeholder:text-slate-300"
+                    />
+                  </div>
+
+                  {/* Quick Auto-Fill Helper Buttons */}
+                  <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                    {currentDue > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setPayAmount(currentDue.toString())}
+                        className="px-2.5 py-1.5 bg-emerald-100 hover:bg-emerald-200 text-emerald-900 rounded-xl text-xs font-black transition-all cursor-pointer active:scale-95"
+                      >
+                        বাকি সব (৳{currentDue.toLocaleString()})
+                      </button>
+                    )}
+                    {currentDue > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setPayAmount(Math.round(currentDue / 2).toString())}
+                        className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-all cursor-pointer active:scale-95"
+                      >
+                        হাফ (৫০%)
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setPayAmount("5000")}
+                      className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-all cursor-pointer active:scale-95"
+                    >
+                      ৳৫,০০০
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPayAmount("10000")}
+                      className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-all cursor-pointer active:scale-95"
+                    >
+                      ৳১০,০০০
+                    </button>
+                    {parsedPayAmount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setPayAmount("")}
+                        className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-xl text-xs font-bold transition-all cursor-pointer active:scale-95 ml-auto"
+                      >
+                        ক্লিয়ার
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Dynamic remaining calculation */}
+                  {parsedPayAmount > 0 && (
+                    <div className="p-3 bg-emerald-50/70 border border-emerald-200 rounded-2xl flex items-center justify-between text-xs font-bold text-emerald-900 animate-in fade-in">
+                      <span>এই পরিমাণ প্রদানের পর অবশিষ্ট থাকবে:</span>
+                      <span className="font-mono font-black text-sm text-emerald-800">
+                        ৳{remainingAfterPay.toLocaleString()}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Payment Method */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-widest pl-1">Payment Method (পরিশোধের মাধ্যম)</label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setPayMethod("Cash")}
+                      className={cn(
+                        "flex items-center justify-center gap-2 p-3.5 rounded-2xl border-2 transition-all font-bold cursor-pointer text-xs uppercase tracking-wider",
+                        payMethod === "Cash" ? "border-slate-900 bg-slate-900 text-white shadow-sm" : "border-slate-200 text-slate-500 hover:border-slate-300"
+                      )}
+                    >
+                      <Wallet className="w-4 h-4 text-amber-400" /> Cash (ক্যাশ)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPayMethod(banks[0]?.name || "Bank")}
+                      className={cn(
+                        "flex items-center justify-center gap-2 p-3.5 rounded-2xl border-2 transition-all font-bold cursor-pointer text-xs uppercase tracking-wider",
+                        payMethod !== "Cash" ? "border-slate-900 bg-slate-900 text-white shadow-sm" : "border-slate-200 text-slate-500 hover:border-slate-300"
+                      )}
+                    >
+                      <Landmark className="w-4 h-4 text-indigo-400" /> Bank (ব্যাংক)
+                    </button>
+                  </div>
+                  {payMethod !== "Cash" && banks.length > 0 && (
+                    <select
+                      value={payMethod}
+                      onChange={(e) => setPayMethod(e.target.value)}
+                      className="w-full mt-2 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-xs font-bold text-slate-800 outline-none cursor-pointer"
+                    >
+                      {banks.map(b => (
+                        <option key={b.id} value={b.name}>{b.name} (ব্যালেন্স: ৳{b.balance.toLocaleString()})</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+
+                {/* Notes */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-widest pl-1">রেফারেন্স / নোটস (Optional)</label>
+                  <input
+                    placeholder="e.g. চলতি মাসের বেতন ও অগ্রিম প্রদান"
+                    value={payNotes}
+                    onChange={(e) => setPayNotes(e.target.value)}
+                    className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:border-slate-900 focus:bg-white text-xs font-bold text-slate-800 outline-none transition-all placeholder:text-slate-400"
+                  />
+                </div>
+
+                {/* Submit Button */}
+                <button
+                  type="submit"
+                  disabled={isPaying || !payAmount || parseFloat(payAmount) <= 0}
+                  className="w-full py-4 sm:py-5 rounded-2xl font-black text-base sm:text-lg shadow-xl shadow-emerald-700/20 transition-all active:scale-98 disabled:opacity-50 text-white bg-emerald-600 hover:bg-emerald-700 cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <Coins className="w-5 h-5" />
+                  {isPaying ? "প্রক্রিয়াধীন..." : "বেতন ও অগ্রিম প্রদান নিশ্চিত করুন (Confirm Payment)"}
+                </button>
+              </form>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Custom Employee Delete Modal */}
+      {employeeToDelete && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-[32px] max-w-md w-full p-8 shadow-2xl border border-gray-100 animate-in zoom-in-95 duration-200">
+            <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center text-red-600 mb-6">
+              <Trash2 className="w-6 h-6" />
+            </div>
+            <h3 className="text-xl font-bold text-gray-900 mb-2">Remove Employee?</h3>
+            <p className="text-sm text-gray-500 mb-6">
+              Are you sure you want to remove this employee? This will not delete their transaction history.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setEmployeeToDelete(null)}
+                className="px-5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteEmployee}
+                className="px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold transition-all shadow-lg active:scale-95"
+              >
+                Yes, Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AttendanceHistoryModal({ employee, onClose }: { employee: Employee; onClose: () => void }) {
+  const [records, setRecords] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const currentYear = new Date().getFullYear();
+
+  useEffect(() => {
+    const start = startOfYear(new Date());
+    const end = endOfYear(new Date());
+    
+    const q = query(
+      collection(db, "attendance"),
+      where("employeeId", "==", employee.id),
+      where("date", ">=", start.toISOString()),
+      where("date", "<=", end.toISOString()),
+      orderBy("date", "desc")
+    );
+
+    getDocs(q).then(snap => {
+      setRecords(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      setLoading(false);
+    });
+  }, [employee.id]);
+
+  const stats = {
+    present: records.filter(r => r.status === "present").length,
+    late: records.filter(r => r.status === "late").length,
+    absent: records.filter(r => r.status === "absent").length,
+    leave: records.filter(r => r.status === "leave").length,
+    halfDay: records.filter(r => r.status === "half-day").length,
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-[70] flex items-center justify-center p-4">
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.9, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.9, y: 20 }}
+        className="bg-white w-full max-w-2xl rounded-[40px] overflow-hidden shadow-2xl flex flex-col max-h-[85vh]"
+      >
+        <div className="p-8 border-b border-gray-100 flex items-center justify-between">
+          <div>
+            <h3 className="text-2xl font-black text-gray-900">Attendance History {currentYear}</h3>
+            <p className="text-gray-500 font-bold">{employee.name} • {employee.role}</p>
+          </div>
+          <button onClick={onClose} className="p-3 bg-gray-100 hover:bg-gray-200 rounded-2xl transition-all">
+            <X className="w-5 h-5 text-gray-500" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-8 space-y-8">
+          <div className="grid grid-cols-5 gap-3">
+            <div className="bg-blue-50 p-4 rounded-2xl text-center">
+              <p className="text-[10px] font-black text-blue-400 uppercase mb-1">Present</p>
+              <p className="text-xl font-black text-blue-600">{stats.present}</p>
+            </div>
+            <div className="bg-orange-50 p-4 rounded-2xl text-center">
+              <p className="text-[10px] font-black text-orange-400 uppercase mb-1">Late</p>
+              <p className="text-xl font-black text-orange-600">{stats.late}</p>
+            </div>
+            <div className="bg-red-50 p-4 rounded-2xl text-center">
+              <p className="text-[10px] font-black text-red-400 uppercase mb-1">Absent</p>
+              <p className="text-xl font-black text-red-600">{stats.absent}</p>
+            </div>
+            <div className="bg-indigo-50 p-4 rounded-2xl text-center">
+              <p className="text-[10px] font-black text-indigo-400 uppercase mb-1">Leave</p>
+              <p className="text-xl font-black text-indigo-600">{stats.leave}</p>
+            </div>
+            <div className="bg-yellow-50 p-4 rounded-2xl text-center">
+              <p className="text-[10px] font-black text-yellow-400 uppercase mb-1">Half Day</p>
+              <p className="text-xl font-black text-yellow-600">{stats.halfDay}</p>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            <h4 className="font-bold text-gray-900 border-l-4 border-blue-600 pl-3">Detailed Log</h4>
+            {loading ? (
+              <div className="py-10 text-center text-gray-400">Loading history...</div>
+            ) : records.length === 0 ? (
+              <div className="py-10 text-center text-gray-400 italic">No attendance records found for this year.</div>
+            ) : (
+              <div className="space-y-2">
+                {records.map(record => (
+                  <div key={record.id} className="bg-gray-50 p-4 rounded-2xl flex items-center justify-between border border-gray-100">
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 rounded-xl bg-white flex items-center justify-center font-bold text-gray-600 shadow-sm border border-gray-100">
+                        {format(new Date(record.date), "dd")}
+                      </div>
+                      <div>
+                        <p className="font-bold text-gray-900">{format(new Date(record.date), "MMMM dd, yyyy")}</p>
+                        <p className="text-[10px] font-bold text-gray-400 uppercase">
+                          In: {record.checkIn || "--:--"} 
+                          {record.lunchOut && ` • Lunch: ${record.lunchOut} - ${record.lunchIn || "--:--"}`}
+                        </p>
+                      </div>
+                    </div>
+                    <span className={cn(
+                      "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest",
+                      record.status === "present" && "bg-blue-100 text-blue-700",
+                      record.status === "late" && "bg-orange-100 text-orange-700",
+                      record.status === "absent" && "bg-red-100 text-red-700",
+                      record.status === "leave" && "bg-indigo-100 text-indigo-700",
+                      record.status === "half-day" && "bg-yellow-100 text-yellow-700",
+                    )}>
+                      {record.status}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  );
+}

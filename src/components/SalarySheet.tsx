@@ -1,0 +1,723 @@
+import React, { useState, useEffect } from "react";
+import { User } from "firebase/auth";
+import { collection, onSnapshot, query, where, deleteDoc, doc, writeBatch, increment } from "firebase/firestore";
+import { db, OperationType, handleFirestoreError } from "@/src/lib/firebase";
+import { Employee, Bank, Transaction, UserRole } from "@/src/types";
+import { cn, formatCurrency } from "@/src/lib/utils";
+import { 
+  FileText, 
+  Calendar, 
+  Trash2, 
+  UserCircle, 
+  CheckCircle, 
+  AlertTriangle, 
+  ArrowUpRight, 
+  Activity, 
+  History, 
+  TrendingDown, 
+  Users, 
+  CreditCard,
+  Search,
+  Filter,
+  FileDown,
+  Download,
+  Printer
+} from "lucide-react";
+import { format, startOfMonth, endOfMonth, isWithinInterval, parseISO } from "date-fns";
+import { exportHtmlToPdf } from "@/src/lib/pdfExport";
+
+export default function SalarySheet({ user, role }: { user: User; role: UserRole }) {
+  const normalizedRole = (role || "").toLowerCase().trim();
+  const isSuperAdmin = 
+    normalizedRole === "super_admin" ||
+    normalizedRole === "superadmin" ||
+    normalizedRole === "super admin" ||
+    normalizedRole.includes("super") ||
+    normalizedRole === "admin" ||
+    normalizedRole.includes("administrator") ||
+    user?.email?.toLowerCase() === "modern@admin.com";
+
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [banks, setBanks] = useState<Bank[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Company info state for printing/branding
+  const [companyName, setCompanyName] = useState("Modern Pro");
+  const [companyTagline, setCompanyTagline] = useState("Automated POS");
+  const [companyLogoUrl, setCompanyLogoUrl] = useState("");
+  const [companyPhone, setCompanyPhone] = useState("+880 1234 567890");
+  const [companyEmail, setCompanyEmail] = useState("info@modernmanager.com");
+  const [companyAddress, setCompanyAddress] = useState("Dhaka, Bangladesh");
+  const [companyPoweredBy, setCompanyPoweredBy] = useState("Powered by ModernManager");
+
+  // Month-Year Selection
+  const [selectedMonth, setSelectedMonth] = useState<string>(format(new Date(), "yyyy-MM")); // e.g. "2026-05"
+  const [employeeSearch, setEmployeeSearch] = useState("");
+
+  // Deletion Confirmation State
+  const [payoutToDelete, setPayoutToDelete] = useState<Transaction | null>(null);
+
+  useEffect(() => {
+    // Snap company settings
+    const unsubCompany = onSnapshot(doc(db, "settings", "company"), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setCompanyName(data.companyName || "Modern Pro");
+        setCompanyTagline(data.companyTagline || "Automated POS");
+        setCompanyLogoUrl(data.companyLogoUrl || "");
+        setCompanyPhone(data.companyPhone || "+880 1234 567890");
+        setCompanyEmail(data.companyEmail || "info@modernmanager.com");
+        setCompanyAddress(data.companyAddress || "Dhaka, Bangladesh");
+        setCompanyPoweredBy(data.companyPoweredBy || "Powered by ModernManager");
+      }
+    }, (error) => handleFirestoreError(error, OperationType.GET, "settings/company"));
+
+    // Snap employees
+    const unsubEmps = onSnapshot(collection(db, "employees"), (snap) => {
+      const emps = snap.docs.map(d => ({ id: d.id, ...d.data() } as Employee));
+      emps.sort((a, b) => {
+        const dateA = a.joinedDate ? new Date(a.joinedDate).getTime() : 0;
+        const dateB = b.joinedDate ? new Date(b.joinedDate).getTime() : 0;
+        if (dateA !== dateB) return dateA - dateB;
+        return (a.name || "").localeCompare(b.name || "");
+      });
+      setEmployees(emps);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, "employees"));
+
+    // Snap transactions focused on Staff Salary and Employee Advance
+    const unsubTx = onSnapshot(collection(db, "transactions"), (snap) => {
+      const allTx = snap.docs.map(d => ({ id: d.id, ...d.data() } as Transaction));
+      const payTx = allTx.filter(t => t.category === "Staff Salary" || t.category === "Employee Advance");
+      setTransactions(payTx);
+      setLoading(false);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, "transactions"));
+
+    // Snap banks for safe reversion of deleted payouts
+    const unsubBanks = onSnapshot(collection(db, "banks"), (snap) => {
+      setBanks(snap.docs.map(d => ({ id: d.id, ...d.data() } as Bank)));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, "banks"));
+
+    return () => { unsubCompany(); unsubEmps(); unsubTx(); unsubBanks(); };
+  }, []);
+
+  const confirmDeletePayout = async () => {
+    if (!payoutToDelete) return;
+    const tx = payoutToDelete;
+    setPayoutToDelete(null);
+    try {
+      if (!tx.id) return;
+      const batch = writeBatch(db);
+      batch.delete(doc(db, "transactions", tx.id));
+
+      if (tx.paymentMethod && tx.paymentMethod !== "Cash") {
+        const bank = banks.find(b => b.name === tx.paymentMethod);
+        if (bank?.id) {
+          batch.update(doc(db, "banks", bank.id), {
+            balance: increment(tx.amount), // Revert subtraction
+            lastUpdated: new Date().toISOString()
+          });
+        }
+      }
+      
+      await batch.commit();
+    } catch (e) {
+      handleFirestoreError(e, OperationType.DELETE, "transactions");
+    }
+  };
+
+  // Helper: calculate salaries paid in the selected period
+  const getSelectedMonthDates = () => {
+    try {
+      const year = parseInt(selectedMonth.split("-")[0]);
+      const month = parseInt(selectedMonth.split("-")[1]) - 1;
+      const start = startOfMonth(new Date(year, month, 1));
+      const end = endOfMonth(new Date(year, month, 1));
+      return { start, end };
+    } catch {
+      const today = new Date();
+      return { start: startOfMonth(today), end: endOfMonth(today) };
+    }
+  };
+
+  const { start, end } = getSelectedMonthDates();
+
+  // Filter transactions within selected month
+  const monthTransactions = transactions.filter(tx => {
+    try {
+      const txDate = parseISO(tx.date);
+      return isWithinInterval(txDate, { start, end });
+    } catch {
+      return false;
+    }
+  });
+
+  // Calculate Employee Stats for selection
+  const employeeBalances = employees.map(emp => {
+    const empTxs = monthTransactions.filter(tx => tx.employeeId === emp.id);
+    const salaryPaid = empTxs
+      .filter(tx => tx.category === "Staff Salary")
+      .reduce((sum, tx) => sum + tx.amount, 0);
+    const advanceGiven = empTxs
+      .filter(tx => tx.category === "Employee Advance")
+      .reduce((sum, tx) => sum + tx.amount, 0);
+    const totalPaid = salaryPaid + advanceGiven;
+    const remainingDue = Math.max(0, (emp.salary || 0) - totalPaid);
+    
+    // Status
+    let status: "unpaid" | "partial" | "paid" = "unpaid";
+    if (totalPaid >= emp.salary && emp.salary > 0) {
+      status = "paid";
+    } else if (totalPaid > 0) {
+      status = "partial";
+    }
+
+    return {
+      ...emp,
+      salaryPaid,
+      advanceGiven,
+      totalPaid,
+      remainingDue,
+      status
+    };
+  });
+
+  // Filter by search query
+  const filteredEmployeeBalances = employeeBalances.filter(emp => 
+    emp.name.toLowerCase().includes(employeeSearch.toLowerCase()) ||
+    emp.role.toLowerCase().includes(employeeSearch.toLowerCase()) ||
+    (emp.department && emp.department.toLowerCase().includes(employeeSearch.toLowerCase()))
+  );
+
+  // General Aggregates for Selected Month
+  const activeStaff = employees.filter(e => e.status === "active");
+  const totalBasePayroll = activeStaff.reduce((sum, e) => sum + e.salary, 0);
+  const totalPaidSalary = monthTransactions
+    .filter(tx => tx.category === "Staff Salary")
+    .reduce((sum, tx) => sum + tx.amount, 0);
+  const totalDisbursedAdvance = monthTransactions
+    .filter(tx => tx.category === "Employee Advance")
+    .reduce((sum, tx) => sum + tx.amount, 0);
+  const netDisbursement = totalPaidSalary + totalDisbursedAdvance;
+  const totalRemainingPayrollDue = Math.max(0, totalBasePayroll - netDisbursement);
+
+  // Render Month labels
+  const monthLabelStr = format(start, "MMMM yyyy");
+
+  // Multi-option Month Select Items
+  const generateMonthsDropdown = () => {
+    const list = [];
+    const date = new Date();
+    // Generate past 24 months
+    for (let i = 0; i < 24; i++) {
+      const optionMonth = new Date(date.getFullYear(), date.getMonth() - i, 1);
+      list.push({
+        value: format(optionMonth, "yyyy-MM"),
+        label: format(optionMonth, "MMMM yyyy")
+      });
+    }
+    return list;
+  };
+
+  const exportToPDF = async () => {
+    const kpis = [
+      { label: "Base Payroll", value: isSuperAdmin ? `BDT ${totalBasePayroll.toLocaleString()}` : "***" },
+      { label: "Total Paid / Advance", value: isSuperAdmin ? `BDT ${netDisbursement.toLocaleString()}` : "***" },
+      { label: "Remaining Balance", value: isSuperAdmin ? `BDT ${totalRemainingPayrollDue.toLocaleString()}` : "***" }
+    ];
+
+    const kpiCardsHtml = kpis.map(k => `
+      <div style="flex: 1; background-color: #f9fafb; border: 1px solid #e5e7eb; border-top: 2px solid #334155; border-radius: 6px; padding: 10px 12px; margin-right: 12px;">
+        <div style="font-size: 9px; font-weight: 800; color: #6b7280; text-transform: uppercase; margin-bottom: 4px;">${k.label}</div>
+        <div style="font-size: 13px; font-weight: 800; color: #0f172a; font-family: monospace;">${k.value}</div>
+      </div>
+    `).join("");
+
+    const staffRowsHtml = filteredEmployeeBalances.map((emp) => `
+      <tr>
+        <td style="font-weight: 700; color: #0f172a;">${emp.name}</td>
+        <td>${emp.role}${emp.department ? ` (${emp.department})` : ""}</td>
+        <td style="text-align: right; font-weight: 700; font-family: monospace;">${isSuperAdmin ? `BDT ${emp.salary.toLocaleString()}` : "***"}</td>
+        <td style="text-align: right; font-weight: 700; color: #10b981; font-family: monospace;">${isSuperAdmin ? `BDT ${emp.totalPaid.toLocaleString()}` : "***"}</td>
+        <td style="text-align: right; font-weight: 700; color: #f59e0b; font-family: monospace;">${isSuperAdmin ? `BDT ${emp.remainingDue.toLocaleString()}` : "***"}</td>
+        <td style="text-align: center; font-weight: 800; font-size: 10px; text-transform: uppercase;">${emp.status}</td>
+      </tr>
+    `).join("");
+
+    const sortedMonthTxs = [...monthTransactions].sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    const ledgerRowsHtml = sortedMonthTxs.map((tx) => `
+      <tr>
+        <td>${format(parseISO(tx.date), "dd MMM yyyy")}</td>
+        <td style="font-weight: 700; color: #0f172a;">${tx.subCategory}</td>
+        <td>${tx.category === "Staff Salary" ? "Salary Payment" : "Advance Disbursement"}</td>
+        <td>${tx.paymentMethod}</td>
+        <td style="text-align: right; font-weight: 800; color: #0f172a; font-family: monospace;">${isSuperAdmin ? `BDT ${tx.amount.toLocaleString()}` : "***"}</td>
+        <td>${tx.notes || "-"}</td>
+      </tr>
+    `).join("");
+
+    const htmlContent = `
+      <div style="font-size: 12px; color: #0f172a; line-height: 1.5;">
+        <!-- Header Banner -->
+        <div style="background-color: #0f172a; color: #ffffff; padding: 20px 24px; border-radius: 8px 8px 0 0;">
+          <h1 style="margin: 0 0 6px 0; font-size: 22px; font-weight: 900; letter-spacing: 0.5px; text-transform: uppercase; color: #ffffff;">MONTHLY PAYROLL RECONCILIATION</h1>
+          <p style="margin: 0 0 2px 0; font-size: 11px; color: #9ca3af;">Billing Period: ${monthLabelStr}</p>
+          <p style="margin: 0; font-size: 11px; color: #9ca3af;">Generated On: ${format(new Date(), "dd MMM yyyy, hh:mm a")}</p>
+        </div>
+        <div style="height: 4px; background-color: #0ea5e9; margin-bottom: 20px;"></div>
+
+        <!-- KPIs -->
+        <div style="margin-bottom: 24px;">
+          <h2 style="font-size: 11px; font-weight: 800; color: #4b5563; text-transform: uppercase; margin: 0 0 10px 0;">PAYROLL METRICS SUMMARY</h2>
+          <div style="display: flex;">
+            ${kpiCardsHtml}
+          </div>
+        </div>
+
+        <!-- Staff Table -->
+        <div style="margin-bottom: 24px;">
+          <h2 style="font-size: 11px; font-weight: 800; color: #4b5563; text-transform: uppercase; margin: 0 0 10px 0;">STAFF BALANCES & STATS</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Employee Name</th>
+                <th>Role / Department</th>
+                <th style="text-align: right;">Basic Salary</th>
+                <th style="text-align: right;">Paid to Date</th>
+                <th style="text-align: right;">Advance Given</th>
+                <th style="text-align: center;">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${staffRowsHtml}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Journal Table -->
+        <div style="margin-bottom: 24px;">
+          <h2 style="font-size: 11px; font-weight: 800; color: #4b5563; text-transform: uppercase; margin: 0 0 10px 0;">RECENT PAYROLL LEDGER TRANSACTION JOURNAL</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Employee Target</th>
+                <th>Category</th>
+                <th>Payment Method</th>
+                <th style="text-align: right;">Amount Paid</th>
+                <th>Reference Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${ledgerRowsHtml}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Footer -->
+        <div style="margin-top: 30px; font-size: 9px; color: #9ca3af; font-style: italic; text-align: center; border-top: 1px solid #f3f4f6; padding-top: 8px;">
+          Generated via Smart Payroll Management Ledger Client. Standard audit trails preserved.
+        </div>
+      </div>
+    `;
+
+    await exportHtmlToPdf(htmlContent, `Salary_Sheet_${selectedMonth}.pdf`);
+  };
+
+  const exportToCSV = () => {
+    // CSV headers
+    const headers = ["Employee Name", "Role", "Department", "Basic Salary (BDT)", "Total Paid / Advance (BDT)", "Remaining Due (BDT)", "Reconciliation Status"];
+    
+    // CSV rows
+    const rows = filteredEmployeeBalances.map((emp) => [
+      `"${emp.name.replace(/"/g, '""')}"`,
+      `"${(emp.role || "").replace(/"/g, '""')}"`,
+      `"${(emp.department || "").replace(/"/g, '""')}"`,
+      isSuperAdmin ? emp.salary : "***",
+      isSuperAdmin ? emp.totalPaid : "***",
+      isSuperAdmin ? emp.remainingDue : "***",
+      emp.status.toUpperCase()
+    ]);
+    
+    const csvContent = "data:text/csv;charset=utf-8," 
+      + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
+      
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `Salary_Sheet_${selectedMonth}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  if (loading) {
+    return <div className="py-20 text-center text-gray-400 font-medium">Drafting payroll analysis...</div>;
+  }
+
+  return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      {/* Custom Printed Header (Visible ONLY during print layout) */}
+      <div className="print:flex hidden flex-col w-full border-b-[3px] border-slate-950 pb-5 mb-8">
+        <div className="flex justify-between items-start w-full">
+          {/* Left: Branding & Info */}
+          <div className="space-y-1.5 col-span-2">
+            <div className="flex items-center gap-3">
+              {companyLogoUrl ? (
+                <img src={companyLogoUrl} alt="Logo" className="w-12 h-12 object-contain rounded-lg" referrerPolicy="no-referrer" />
+              ) : (
+                <div className="w-12 h-12 bg-slate-900 text-white rounded-lg flex items-center justify-center font-black text-xl">
+                  {companyName ? companyName.charAt(0).toUpperCase() : "M"}
+                </div>
+              )}
+              <div>
+                <h1 className="text-2xl font-black text-slate-950 leading-none tracking-tight">{companyName.toUpperCase()}</h1>
+                <p className="text-slate-500 font-bold text-[10px] tracking-wide mt-1.5">{companyTagline}</p>
+              </div>
+            </div>
+            <div className="text-[10px] text-slate-500 font-semibold pt-2 max-w-md space-y-0.5 leading-normal">
+              <p><strong>Address:</strong> {companyAddress}</p>
+              <p><strong>Phone:</strong> {companyPhone} &bull; <strong>Email:</strong> {companyEmail}</p>
+            </div>
+          </div>
+
+          {/* Right: Statement Meta */}
+          <div className="text-right space-y-2 shrink-0">
+            <div className="bg-slate-900 text-white px-3 py-1 rounded-md text-center inline-block">
+              <span className="text-[9px] font-extrabold uppercase tracking-widest block">Payroll Sheet</span>
+            </div>
+            <h2 className="text-base font-black text-slate-950 uppercase tracking-tight mt-1">Monthly Payroll & Salary Ledger</h2>
+            <div className="text-[10px] text-slate-500 space-y-0.5 font-semibold leading-normal">
+              <p><strong>Statement Month:</strong> {selectedMonth ? (() => {
+                try {
+                  const parts = selectedMonth.split("-");
+                  const d = new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, 1);
+                  return format(d, "MMMM yyyy");
+                } catch(e) {}
+                return selectedMonth;
+              })() : "N/A"}</p>
+              <p><strong>Generated By:</strong> {user.email} ({role === "admin" ? "Administrator" : "Manager"})</p>
+              <p><strong>Print Timestamp:</strong> {format(new Date(), "dd MMMM yyyy, hh:mm a")} (BST)</p>
+            </div>
+          </div>
+        </div>
+        <div className="w-full bg-slate-200 h-[1px] mt-4 print:block"></div>
+      </div>
+
+      {/* Header */}
+      <header className="flex flex-col md:flex-row md:items-center justify-between gap-6 print:hidden">
+        <div>
+          <h2 className="text-3xl font-black tracking-tight mb-2 text-gray-950">Salary Sheet</h2>
+          <p className="text-gray-500 font-medium italic">Track employee payouts, monthly breakdowns, and due reconciliations.</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Month Selector */}
+          <div className="flex items-center gap-4 bg-white p-2.5 rounded-[24px] shadow-sm border border-gray-100">
+            <div className="flex items-center gap-2 px-3 text-gray-400">
+              <Filter className="w-4 h-4 text-gray-400" />
+              <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Month:</span>
+            </div>
+            <select
+              value={selectedMonth}
+              onChange={e => setSelectedMonth(e.target.value)}
+              className="pr-8 pl-1 py-1.5 bg-transparent border-none focus:ring-0 font-bold text-gray-900 outline-none cursor-pointer"
+            >
+              {generateMonthsDropdown().map(m => (
+                <option key={m.value} value={m.value}>{m.label}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Export Options */}
+          <div className="flex items-center gap-2 bg-white p-2 rounded-[24px] shadow-sm border border-gray-100">
+            <button
+              onClick={() => window.print()}
+              className="flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-slate-55 text-slate-800 rounded-[16px] text-xs font-bold transition-all cursor-pointer border border-slate-200 shadow-sm"
+              title="Print standard monthly salary ledger"
+            >
+              <Printer className="w-3.5 h-3.5 text-slate-500" />
+              <span>Print</span>
+            </button>
+            <button
+              onClick={exportToPDF}
+              className="flex items-center gap-1.5 px-4 py-2 bg-slate-900 text-white hover:bg-slate-800 rounded-[16px] text-xs font-bold transition-all cursor-pointer shadow-sm"
+              title="Download detailed payroll PDF report"
+            >
+              <FileDown className="w-3.5 h-3.5" />
+              <span>PDF</span>
+            </button>
+            <button
+              onClick={exportToCSV}
+              className="flex items-center gap-1.5 px-4 py-2 bg-slate-50 hover:bg-slate-100 text-slate-800 rounded-[16px] text-xs font-bold transition-all cursor-pointer border border-slate-200"
+              title="Export reconciliations to spreadsheet (CSV)"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>CSV</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* KPI Stats Panel */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        {/* Total Base Payroll */}
+        <div className="bg-white p-5 rounded-[24px] border border-gray-100 shadow-sm hover:shadow-md/40 transition-all flex items-center gap-4">
+          <div className="w-12 h-12 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center shrink-0">
+            <Users className="w-6 h-6" />
+          </div>
+          <div>
+            <p className="text-[10px] uppercase font-bold tracking-widest text-gray-400 leading-none mb-1">Base Payroll</p>
+            <h3 className="text-xl font-bold text-gray-900 font-mono tracking-tight">
+              {isSuperAdmin ? formatCurrency(totalBasePayroll) : "***"}
+            </h3>
+            <span className="text-[9px] text-gray-400 font-semibold">{activeStaff.length} active employees</span>
+          </div>
+        </div>
+
+        {/* Paid This Month */}
+        <div className="bg-white p-5 rounded-[24px] border border-gray-100 shadow-sm hover:shadow-md/40 transition-all flex items-center gap-4">
+          <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center shrink-0">
+            <CheckCircle className="w-6 h-6" />
+          </div>
+          <div>
+            <p className="text-[10px] uppercase font-bold tracking-widest text-gray-400 leading-none mb-1">Total Paid / Advance</p>
+            <h3 className="text-xl font-bold text-emerald-600 font-mono tracking-tight">
+              {isSuperAdmin ? formatCurrency(netDisbursement) : "***"}
+            </h3>
+            <span className="text-[9px] text-emerald-700 font-semibold">{monthTransactions.length} payments recorded</span>
+          </div>
+        </div>
+
+        {/* Remaining Due This Month */}
+        <div className="bg-white p-5 rounded-[24px] border border-gray-100 shadow-sm hover:shadow-md/40 transition-all flex items-center gap-4">
+          <div className="w-12 h-12 bg-amber-50 text-amber-600 rounded-2xl flex items-center justify-center shrink-0">
+            <TrendingDown className="w-5 h-5" />
+          </div>
+          <div>
+            <p className="text-[10px] uppercase font-bold tracking-widest text-gray-400 leading-none mb-1">Remaining Due</p>
+            <h3 className="text-xl font-bold text-amber-600 font-mono tracking-tight">
+              {isSuperAdmin ? formatCurrency(totalRemainingPayrollDue) : "***"}
+            </h3>
+            <span className="text-[9px] text-gray-400 font-semibold">Balance to settle</span>
+          </div>
+        </div>
+
+        {/* Net Monthly Outflow */}
+        <div className="bg-gray-950 p-5 rounded-[24px] shadow-sm flex items-center gap-4">
+          <div className="w-12 h-12 bg-white/10 text-white rounded-2xl flex items-center justify-center shrink-0">
+            <Activity className="w-5 h-5 text-gray-200" />
+          </div>
+          <div>
+            <p className="text-[10px] uppercase font-bold tracking-widest text-gray-400 leading-none mb-1">Net Cash Expense</p>
+            <h3 className="text-xl font-bold text-white font-mono tracking-tight">
+              {isSuperAdmin ? formatCurrency(netDisbursement) : "***"}
+            </h3>
+            <span className="text-[9px] text-gray-400 font-medium">Payroll out in {monthLabelStr}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Breakdown Section */}
+      <div className="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden space-y-4 p-6">
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-2">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">Employee Payroll Reconciliation</h3>
+            <p className="text-xs text-gray-500">Status matches basic monthly salary vs recorded payments for {monthLabelStr}</p>
+          </div>
+          <div className="relative w-full sm:w-72">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Search staff..."
+              value={employeeSearch}
+              onChange={e => setEmployeeSearch(e.target.value)}
+              className="w-full pl-9 pr-4 py-2 bg-gray-50 hover:bg-gray-100/50 rounded-xl border-none outline-none font-semibold text-xs placeholder:text-gray-400"
+            />
+          </div>
+        </div>
+
+        <div className="overflow-x-auto -mx-6">
+          <table className="w-full text-left border-collapse min-w-[700px]">
+            <thead>
+              <tr className="bg-gray-50/50">
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Employee Details</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Monthly Basic</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Total Paid / Advance ({monthLabelStr})</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Remaining Due</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {filteredEmployeeBalances.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="py-12 text-center text-gray-400 italic font-medium">No records found matching filter.</td>
+                </tr>
+              ) : (
+                filteredEmployeeBalances.map(emp => {
+                  return (
+                    <tr key={emp.id} className="hover:bg-slate-50/50 transition-colors">
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 bg-slate-50 border border-slate-100 rounded-xl flex items-center justify-center text-gray-500 overflow-hidden shrink-0">
+                            {emp.documents?.find(d => d.type.startsWith('image/')) ? (
+                              <img src={emp.documents.find(d => d.type.startsWith('image/'))?.data} alt="" className="w-full h-full object-cover" />
+                            ) : (
+                              <UserCircle className="w-6 h-6 text-slate-400" />
+                            )}
+                          </div>
+                          <div>
+                            <p className="font-bold text-gray-900 text-sm leading-none mb-1">{emp.name}</p>
+                            <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest">{emp.role} {emp.department ? `• ${emp.department}` : ""}</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className="font-mono font-bold text-gray-900 text-sm">
+                          {isSuperAdmin ? formatCurrency(emp.salary) : "***"}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className="font-mono font-bold text-emerald-600 text-sm">
+                          {isSuperAdmin ? formatCurrency(emp.totalPaid) : "***"}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className={cn(
+                          "font-mono font-bold text-sm",
+                          emp.remainingDue > 0 ? "text-amber-600" : "text-gray-400"
+                        )}>
+                          {isSuperAdmin ? (emp.remainingDue > 0 ? formatCurrency(emp.remainingDue) : "৳0") : "***"}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4">
+                        {emp.status === "paid" ? (
+                          <span className="px-2.5 py-1.5 bg-green-50 text-green-700 rounded-full font-bold text-[9px] uppercase tracking-wider">
+                            Fully Paid
+                          </span>
+                        ) : emp.status === "partial" ? (
+                          <span className="px-2.5 py-1.5 bg-amber-50 text-amber-700 rounded-full font-bold text-[9px] uppercase tracking-wider">
+                            Partially Paid
+                          </span>
+                        ) : (
+                          <span className="px-2.5 py-1.5 bg-red-50 text-red-700 rounded-full font-bold text-[9px] uppercase tracking-wider">
+                            Unpaid
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Monthly Payout Log Audit table */}
+      <div className="bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden p-6 space-y-4">
+        <div>
+          <h3 className="text-lg font-bold text-gray-900">Recent Payroll Ledger Log</h3>
+          <p className="text-xs text-gray-500">Recorded salary and advance payouts in the transactions journal</p>
+        </div>
+
+        <div className="overflow-x-auto -mx-6">
+          <table className="w-full text-left border-collapse min-w-[700px]">
+            <thead>
+              <tr className="bg-gray-50/50">
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Date</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Employee Target</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">ledger Category</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Method</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Amount Paid</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100">Notes</th>
+                <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest border-b border-gray-100 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {monthTransactions.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-12 text-center text-gray-400 italic font-medium">No recorded entries this month.</td>
+                </tr>
+              ) : (
+                monthTransactions
+                  .sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+                  .map(tx => (
+                    <tr key={tx.id} className="hover:bg-slate-50/40 transition-colors">
+                      <td className="px-6 py-4 font-bold text-xs text-gray-600">
+                        {format(parseISO(tx.date), "dd MMM yyyy")}
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-2">
+                          <UserCircle className="w-4 h-4 text-gray-400" />
+                          <span className="font-bold text-gray-900 text-sm">{tx.subCategory}</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className={cn(
+                          "px-2 py-1 rounded-lg text-[9px] font-bold tracking-wide uppercase",
+                          tx.category === "Staff Salary" ? "bg-green-50 text-green-700 border border-green-100" : "bg-orange-50 text-orange-700 border border-orange-100"
+                        )}>
+                          {tx.category === "Staff Salary" ? "Salary Paid" : "Advance Given"}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 text-xs font-bold text-gray-500">
+                        {tx.paymentMethod}
+                      </td>
+                      <td className="px-6 py-4 font-mono font-bold text-gray-950 text-sm">
+                        {role === "admin" ? formatCurrency(tx.amount) : "***"}
+                      </td>
+                      <td className="px-6 py-4 text-xs text-gray-400 max-w-xs truncate" title={tx.notes}>
+                        {tx.notes || "-"}
+                      </td>
+                      <td className="px-6 py-4 text-right">
+                        <button
+                          onClick={() => setPayoutToDelete(tx)}
+                          className="p-2 hover:bg-red-50 text-gray-400 hover:text-red-600 rounded-xl transition-all border border-transparent hover:border-red-100 inline-flex items-center justify-center cursor-pointer"
+                          title="Delete and revert bank ledger balance"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Custom Payout Delete Modal */}
+      {payoutToDelete && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-[32px] max-w-md w-full p-8 shadow-2xl border border-gray-100 animate-in zoom-in-95 duration-200">
+            <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center text-red-600 mb-6">
+              <Trash2 className="w-6 h-6" />
+            </div>
+            <h3 className="text-xl font-bold text-gray-900 mb-2">Delete Payment?</h3>
+            <p className="text-sm text-gray-500 mb-6">
+              Are you sure you want to delete this payment of <strong className="text-gray-900">{role === "admin" ? formatCurrency(payoutToDelete.amount) : "***"}</strong> recorded for <strong className="text-gray-900">{payoutToDelete.subCategory}</strong>?
+              <br /><br />
+              This will safely credit the amount back to the payment account.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setPayoutToDelete(null)}
+                className="px-5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeletePayout}
+                className="px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold transition-all shadow-lg active:scale-95"
+              >
+                Yes, Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
